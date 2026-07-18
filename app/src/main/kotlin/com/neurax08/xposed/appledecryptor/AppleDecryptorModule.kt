@@ -57,33 +57,36 @@ class AppleDecryptorModule : XposedModule() {
         DownloadSettings.ensureLoaded()
 
         // Resolve application context from PackageReadyParam (libxposed) or ActivityThread fallback.
+        // NOTE: onPackageReady often runs BEFORE Application is ready → context may be null.
+        // SharedQueueStore / DownloadManager also lazy-init later from hooks.
         val appContext = resolveApplicationContext(param)
         if (appContext != null) {
-            // Shared queue via ContentProvider (module private storage, cross-process safe).
-            runCatching {
-                SharedQueueStore.init(appContext)
-                moduleLog(Log.INFO, TAG, "SharedQueueStore init backend=${SharedQueueStore.getActivePath()}")
-            }.onFailure { error ->
-                moduleLog(Log.WARN, TAG, "SharedQueueStore init failed", error)
-            }
-
-            runCatching {
-                // Executor mode: only this process has libandroidappmusic + native decrypt.
-                DownloadManager.init(appContext, asExecutor = true)
-                moduleLog(Log.INFO, TAG, "DownloadManager initialized as executor")
-            }.onFailure { error ->
-                moduleLog(Log.WARN, TAG, "Failed to init DownloadManager", error)
-            }
-
-            runCatching {
-                val intent = Intent(appContext, DownloadNotificationService::class.java)
-                appContext.startForegroundService(intent)
-                moduleLog(Log.INFO, TAG, "DownloadNotificationService started")
-            }.onFailure { error ->
-                moduleLog(Log.WARN, TAG, "Failed to start notification service", error)
-            }
+            bindDownloadStack(appContext, "packageReady")
         } else {
-            moduleLog(Log.WARN, TAG, "Application context unavailable; download features disabled")
+            moduleLog(
+                Log.WARN,
+                TAG,
+                "Application context unavailable at packageReady; will lazy-init on first requestAsset",
+            )
+            // Retry shortly: Application is usually ready within a few hundred ms.
+            Thread({
+                for (attempt in 1..20) {
+                    try {
+                        Thread.sleep(250L)
+                    } catch (_: InterruptedException) {
+                        return@Thread
+                    }
+                    val ctx = resolveApplicationContext(param)
+                    if (ctx != null) {
+                        bindDownloadStack(ctx, "deferred#$attempt")
+                        return@Thread
+                    }
+                }
+                moduleLog(Log.WARN, TAG, "Application context still null after deferred retries")
+            }, "AppleDecryptor-CtxInit").apply {
+                isDaemon = true
+                start()
+            }
         }
 
         installAppleMusicHooks(param.classLoader)
@@ -134,20 +137,33 @@ class AppleDecryptorModule : XposedModule() {
                     lastSeenHlsUrl = hlsUrl
                     DownloadNotificationService.updateTrackInfo(adamId, "Track $adamId", "")
 
+                    // Lazy-bind Context: packageReady often had no Application yet.
+                    val liveCtx = resolveApplicationContext(param = null)
+                        ?: runCatching {
+                            Class.forName("android.app.ActivityThread")
+                                .getMethod("currentApplication")
+                                .invoke(null) as? android.content.Context
+                        }.getOrNull()
+                    if (liveCtx != null && !SharedQueueStore.isInitialized()) {
+                        bindDownloadStack(liveCtx, "requestAsset")
+                    }
+
                     // Always write shared queue immediately (sync, no coroutine dependency).
                     runCatching {
+                        SharedQueueStore.ensureInit(liveCtx)
                         SharedQueueStore.upsertSync(
                             SharedQueueStore.QueueEntry(
                                 adamId = adamId,
                                 title = "Track $adamId",
                                 status = "QUEUED",
                                 hlsUrl = hlsUrl,
-                            )
+                            ),
+                            seedContext = liveCtx,
                         )
                         moduleLog(
                             Log.INFO,
                             TAG,
-                            "SharedQueue wrote adamId=$adamId path=${SharedQueueStore.getActivePath()} err=${SharedQueueStore.lastError}",
+                            "SharedQueue wrote adamId=$adamId path=${SharedQueueStore.getActivePath()} err=${SharedQueueStore.lastError} init=${SharedQueueStore.isInitialized()}",
                         )
                     }.onFailure { error ->
                         moduleLog(Log.WARN, TAG, "SharedQueue write failed", error)
@@ -155,6 +171,9 @@ class AppleDecryptorModule : XposedModule() {
 
                     // Feed URL into download manager. Auto-start gated by settings.
                     runCatching {
+                        if (liveCtx != null) {
+                            DownloadManager.init(liveCtx, asExecutor = true)
+                        }
                         DownloadManager.provideHlsUrl(
                             adamId = adamId,
                             hlsUrl = hlsUrl,
@@ -187,18 +206,49 @@ class AppleDecryptorModule : XposedModule() {
         return asString?.takeIf { it.isNotBlank() }
     }
 
-    private fun resolveApplicationContext(param: PackageReadyParam): android.content.Context? {
+    private fun bindDownloadStack(appContext: android.content.Context, source: String) {
+        runCatching {
+            SharedQueueStore.init(appContext)
+            moduleLog(
+                Log.INFO,
+                TAG,
+                "SharedQueueStore init source=$source backend=${SharedQueueStore.getActivePath()} pkg=${appContext.packageName}",
+            )
+        }.onFailure { error ->
+            moduleLog(Log.WARN, TAG, "SharedQueueStore init failed source=$source", error)
+        }
+
+        runCatching {
+            // Executor mode: only this process has libandroidappmusic + native decrypt.
+            DownloadManager.init(appContext, asExecutor = true)
+            moduleLog(Log.INFO, TAG, "DownloadManager initialized as executor source=$source")
+        }.onFailure { error ->
+            moduleLog(Log.WARN, TAG, "Failed to init DownloadManager source=$source", error)
+        }
+
+        runCatching {
+            val intent = Intent(appContext, DownloadNotificationService::class.java)
+            appContext.startForegroundService(intent)
+            moduleLog(Log.INFO, TAG, "DownloadNotificationService started source=$source")
+        }.onFailure { error ->
+            moduleLog(Log.WARN, TAG, "Failed to start notification service source=$source", error)
+        }
+    }
+
+    private fun resolveApplicationContext(param: PackageReadyParam?): android.content.Context? {
         // Prefer PackageReadyParam.application when present (libxposed API).
-        val fromParam = runCatching {
-            param.javaClass.methods
-                .firstOrNull { it.name == "getApplication" && it.parameterCount == 0 }
-                ?.invoke(param) as? android.content.Context
-                ?: param.javaClass.methods
-                    .firstOrNull { it.name == "getBaseContext" && it.parameterCount == 0 }
+        if (param != null) {
+            val fromParam = runCatching {
+                param.javaClass.methods
+                    .firstOrNull { it.name == "getApplication" && it.parameterCount == 0 }
                     ?.invoke(param) as? android.content.Context
-        }.getOrNull()
-        if (fromParam != null) {
-            return fromParam
+                    ?: param.javaClass.methods
+                        .firstOrNull { it.name == "getBaseContext" && it.parameterCount == 0 }
+                        ?.invoke(param) as? android.content.Context
+            }.getOrNull()
+            if (fromParam != null) {
+                return fromParam
+            }
         }
 
         // Fallback: ActivityThread.currentApplication()
