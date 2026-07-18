@@ -5,6 +5,7 @@ import android.util.Log
 import com.neurax08.xposed.appledecryptor.download.DownloadManager
 import com.neurax08.xposed.appledecryptor.download.DownloadNotificationService
 import com.neurax08.xposed.appledecryptor.download.DownloadSettings
+import com.neurax08.xposed.appledecryptor.download.SharedQueueStore
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 import java.io.IOException
@@ -124,7 +125,27 @@ class AppleDecryptorModule : XposedModule() {
                     lastSeenAdamId = adamId
                     lastSeenHlsUrl = hlsUrl
                     DownloadNotificationService.updateTrackInfo(adamId, "Track $adamId", "")
-                    // Feed URL into download queue. Auto-start is gated by DownloadSettings.autoDownload.
+
+                    // Always write shared queue immediately (sync, no coroutine dependency).
+                    runCatching {
+                        SharedQueueStore.upsertSync(
+                            SharedQueueStore.QueueEntry(
+                                adamId = adamId,
+                                title = "Track $adamId",
+                                status = "QUEUED",
+                                hlsUrl = hlsUrl,
+                            )
+                        )
+                        moduleLog(
+                            Log.INFO,
+                            TAG,
+                            "SharedQueue wrote adamId=$adamId path=${SharedQueueStore.getActivePath()} err=${SharedQueueStore.lastError}",
+                        )
+                    }.onFailure { error ->
+                        moduleLog(Log.WARN, TAG, "SharedQueue write failed", error)
+                    }
+
+                    // Feed URL into download manager. Auto-start gated by settings.
                     runCatching {
                         DownloadManager.provideHlsUrl(
                             adamId = adamId,

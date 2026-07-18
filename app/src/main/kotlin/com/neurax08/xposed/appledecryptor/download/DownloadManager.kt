@@ -131,6 +131,21 @@ object DownloadManager {
             dao?.insert(item)
             Log.i(TAG, "Enqueued download adamId=$adamId title=${item.title} executor=$executorMode")
 
+            // Also persist to shared cross-process queue (visible to UI).
+            runCatching {
+                kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
+                    SharedQueueStore.upsert(
+                        SharedQueueStore.QueueEntry(
+                            adamId = adamId,
+                            title = title.ifBlank { item.title },
+                            artist = artist,
+                            status = "QUEUED",
+                            hlsUrl = hlsUrl.ifBlank { item.hlsUrl },
+                        )
+                    )
+                }
+            }
+
             // Only the Apple Music process can actually decrypt/download.
             // UI process just writes the shared queue; the executor poller picks it up.
             if (item.hlsUrl.isNotBlank() && canExecuteDownloads()) {
@@ -237,6 +252,18 @@ object DownloadManager {
         val item = dao?.getItem(adamId) ?: return
         val m4aWriter = M4aWriter()
         dao?.update(item.copy(status = "DOWNLOADING"))
+        runCatching {
+            SharedQueueStore.upsertSync(
+                SharedQueueStore.QueueEntry(
+                    adamId = adamId,
+                    title = item.title,
+                    artist = item.artist,
+                    status = "DOWNLOADING",
+                    progress = 0,
+                    hlsUrl = item.hlsUrl,
+                )
+            )
+        }
 
         try {
             val m3u8Url = item.hlsUrl
@@ -309,6 +336,19 @@ object DownloadManager {
 
                 val progress = ((index + 1) * 100) / segments.size
                 dao?.update(item.copy(progress = progress, completedSegments = index + 1))
+                runCatching {
+                    SharedQueueStore.upsertSync(
+                        SharedQueueStore.QueueEntry(
+                            adamId = adamId,
+                            title = item.title,
+                            status = "DOWNLOADING",
+                            progress = progress,
+                            totalSegments = segments.size,
+                            completedSegments = index + 1,
+                            hlsUrl = item.hlsUrl,
+                        )
+                    )
+                }
                 updateProgress(adamId, item.title, progress, "DOWNLOADING")
             }
 
@@ -346,6 +386,19 @@ object DownloadManager {
                     filePath = outputPath,
                 ),
             )
+            runCatching {
+                kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
+                    SharedQueueStore.upsert(
+                        SharedQueueStore.QueueEntry(
+                            adamId = adamId,
+                            title = item.title,
+                            status = "COMPLETED",
+                            progress = 100,
+                            filePath = outputPath,
+                        )
+                    )
+                }
+            }
             updateProgress(adamId, item.title, 100, "COMPLETED")
             showDownloadCompleteNotification(ctx, title, outputPath)
         } catch (e: Exception) {
@@ -356,6 +409,21 @@ object DownloadManager {
                     errorMessage = e.message ?: "Unknown error",
                 ),
             )
+            runCatching {
+                kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
+                    val entry = SharedQueueStore.get(adamId)
+                    SharedQueueStore.upsert(
+                        entry?.copy(
+                            status = "FAILED",
+                            errorMessage = e.message ?: "Unknown error",
+                        ) ?: SharedQueueStore.QueueEntry(
+                            adamId = adamId,
+                            status = "FAILED",
+                            errorMessage = e.message ?: "Unknown error",
+                        )
+                    )
+                }
+            }
             updateProgress(adamId, item.title, 0, "FAILED", e.message ?: "Unknown error")
             showDownloadFailedNotification(ctx, item.title.ifBlank { adamId }, e.message ?: "Unknown error")
         }
@@ -529,9 +597,17 @@ object DownloadManager {
                 if (existing.hlsUrl != hlsUrl) {
                     dao?.update(existing.copy(hlsUrl = hlsUrl))
                 }
-                // Start only if:
-                // - auto download is on, or
-                // - this row was manually queued and waiting for a URL
+                // Update shared queue
+                runCatching {
+                    SharedQueueStore.upsert(
+                        SharedQueueStore.QueueEntry(
+                            adamId = adamId,
+                            title = existing.title,
+                            status = existing.status,
+                            hlsUrl = hlsUrl,
+                        )
+                    )
+                }
                 val shouldStart = (existing.status == "QUEUED" || existing.status == "FAILED") &&
                     (autoEnqueue || waitingForUrl)
                 if (shouldStart && canExecuteDownloads()) {
@@ -549,6 +625,16 @@ object DownloadManager {
                     hlsUrl = hlsUrl,
                 ),
             )
+            // Shared queue
+            runCatching {
+                SharedQueueStore.upsert(
+                    SharedQueueStore.QueueEntry(
+                        adamId = adamId,
+                        title = "Track $adamId",
+                        hlsUrl = hlsUrl,
+                    )
+                )
+            }
             if (autoEnqueue && canExecuteDownloads()) {
                 startDownload(adamId)
                 Log.i(TAG, "Auto-download started adamId=$adamId")

@@ -1,6 +1,7 @@
 package com.neurax08.xposed.appledecryptor
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -31,22 +32,31 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewModelScope
 import com.neurax08.xposed.appledecryptor.download.DownloadManager
 import com.neurax08.xposed.appledecryptor.download.DownloadQueueItem
 import com.neurax08.xposed.appledecryptor.download.DownloadSettings
 import com.neurax08.xposed.appledecryptor.download.M4aWriter
+import com.neurax08.xposed.appledecryptor.download.SharedQueueStore
 import com.neurax08.xposed.appledecryptor.ui.theme.ComposeEmptyActivityTheme
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,6 +86,17 @@ fun DownloadManagerScreen(
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Queue", "Manual", "Settings")
 
+    // Auto-refresh queue every 3 seconds while Queue tab is visible
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(selectedTab) {
+        while (isActive) {
+            if (selectedTab == 0) {
+                viewModel.refresh()
+            }
+            delay(3000L)
+        }
+    }
+
     Column(modifier = modifier.fillMaxSize()) {
         TabRow(selectedTabIndex = selectedTab) {
             tabs.forEachIndexed { index, title ->
@@ -97,7 +118,7 @@ fun DownloadManagerScreen(
 
 @Composable
 fun QueueTab(
-    items: List<DownloadQueueItem>,
+    items: List<SharedQueueStore.QueueEntry>,
     viewModel: DownloadViewModel,
 ) {
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -121,10 +142,17 @@ fun QueueTab(
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = "Shared queue path: /sdcard/Music/AppleDecryptor/db/",
+            text = "Shared queue: ${SharedQueueStore.getActivePath()}",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (SharedQueueStore.lastError.isNotBlank()) {
+            Text(
+                text = SharedQueueStore.lastError,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
         Spacer(modifier = Modifier.height(8.dp))
 
         if (items.isEmpty()) {
@@ -152,7 +180,7 @@ fun QueueTab(
 
 @Composable
 fun DownloadItemCard(
-    item: DownloadQueueItem,
+    item: SharedQueueStore.QueueEntry,
     viewModel: DownloadViewModel,
 ) {
     Card(
@@ -317,11 +345,10 @@ fun ManualInputTab(viewModel: DownloadViewModel) {
         Button(
             onClick = {
                 if (adamId.isNotBlank()) {
-                    DownloadManager.enqueue(
-                        adamId = adamId.trim(),
-                        title = title.trim(),
-                        artist = artist.trim(),
-                    )
+                    val id = adamId.trim()
+                    val t = title.trim()
+                    val a = artist.trim()
+                    viewModel.addManual(id, t, a)
                     adamId = ""
                     title = ""
                     artist = ""
@@ -336,19 +363,10 @@ fun ManualInputTab(viewModel: DownloadViewModel) {
         Spacer(modifier = Modifier.height(8.dp))
 
         TextButton(
-            onClick = {
-                val lastId = AppleDecryptorModule.lastSeenAdamId
-                val lastUrl = AppleDecryptorModule.lastSeenHlsUrl
-                if (lastId != null) {
-                    DownloadManager.enqueue(
-                        adamId = lastId,
-                        hlsUrl = lastUrl.orEmpty(),
-                    )
-                }
-            },
+            onClick = { viewModel.refresh() },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("Download Last Detected Track")
+            Text("Refresh Queue")
         }
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -427,20 +445,27 @@ fun SettingsTab() {
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "Shared Queue DB",
+            text = "Shared Queue File",
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.Medium,
         )
         Text(
-            text = "/sdcard/Music/AppleDecryptor/db/appledecryptor_downloads.db",
+            text = SharedQueueStore.getActivePath(),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            text = "UI process and Apple Music hook process share this path so the queue is visible across processes.",
+            text = "Hook process writes this JSON file; UI process polls it every 3s. Fallback: /data/local/tmp/appledecryptor_queue.json",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (SharedQueueStore.lastError.isNotBlank()) {
+            Text(
+                text = SharedQueueStore.lastError,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
 
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -527,9 +552,72 @@ private fun SettingsSwitchRow(
 }
 
 class DownloadViewModel : androidx.lifecycle.ViewModel() {
-    val queueItems = DownloadManager.getAllItems()
+    private val _queueItems = MutableStateFlow<List<SharedQueueStore.QueueEntry>>(emptyList())
+    val queueItems: StateFlow<List<SharedQueueStore.QueueEntry>> = _queueItems
 
-    fun retry(adamId: String) = DownloadManager.retry(adamId)
-    fun cancel(adamId: String) = DownloadManager.cancel(adamId)
-    fun clearCompleted() = DownloadManager.clearCompleted()
+    init {
+        refresh()
+    }
+
+    fun refresh() {
+        viewModelScope.launch {
+            val items = SharedQueueStore.load()
+            _queueItems.value = items
+            Log.i("AppleDecryptor", "UI queue refresh size=${items.size} path=${SharedQueueStore.getActivePath()} err=${SharedQueueStore.lastError}")
+        }
+    }
+
+    fun addManual(adamId: String, title: String, artist: String) {
+        viewModelScope.launch {
+            SharedQueueStore.upsert(
+                SharedQueueStore.QueueEntry(
+                    adamId = adamId,
+                    title = title,
+                    artist = artist,
+                    status = "QUEUED",
+                )
+            )
+            DownloadManager.enqueue(adamId = adamId, title = title, artist = artist)
+            refresh()
+        }
+    }
+
+    fun retry(adamId: String) {
+        viewModelScope.launch {
+            val existing = SharedQueueStore.get(adamId)
+            SharedQueueStore.upsert(
+                (existing ?: SharedQueueStore.QueueEntry(adamId = adamId)).copy(
+                    status = "QUEUED",
+                    progress = 0,
+                    errorMessage = "",
+                    completedSegments = 0,
+                )
+            )
+            DownloadManager.retry(adamId)
+            refresh()
+        }
+    }
+
+    fun cancel(adamId: String) {
+        viewModelScope.launch {
+            val existing = SharedQueueStore.get(adamId)
+            if (existing != null) {
+                SharedQueueStore.upsert(existing.copy(status = "CANCELED"))
+            }
+            DownloadManager.cancel(adamId)
+            refresh()
+        }
+    }
+
+    fun clearCompleted() {
+        viewModelScope.launch {
+            val items = _queueItems.value
+            for (item in items) {
+                if (item.status == "COMPLETED") {
+                    SharedQueueStore.delete(item.adamId)
+                }
+            }
+            refresh()
+        }
+    }
 }
