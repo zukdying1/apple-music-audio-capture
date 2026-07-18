@@ -361,18 +361,18 @@ object DownloadManager {
                 val progress = ((index + 1) * 100) / segments.size
                 dao?.update(item.copy(progress = progress, completedSegments = index + 1))
                 runCatching {
-                                    SharedQueueStore.upsertSync(
-                                        SharedQueueStore.QueueEntry(
-                                            adamId = adamId,
-                                            title = item.title,
-                                            status = "DOWNLOADING",
-                                            progress = progress,
-                                            totalSegments = segments.size,
-                                            completedSegments = index + 1,
-                                            hlsUrl = item.hlsUrl,
-                                        )
-                                    )
-                                }
+                    SharedQueueStore.upsertSync(
+                        SharedQueueStore.QueueEntry(
+                            adamId = adamId,
+                            title = item.title,
+                            status = "DOWNLOADING",
+                            progress = progress,
+                            totalSegments = segments.size,
+                            completedSegments = index + 1,
+                            hlsUrl = item.hlsUrl,
+                        )
+                    )
+                }
                 updateProgress(adamId, item.title, progress, "DOWNLOADING")
                 // Hint GC between segments to keep heap free for next fMP4.
                 if (index % 4 == 3) {
@@ -417,16 +417,19 @@ object DownloadManager {
                 ),
             )
             runCatching {
-                            SharedQueueStore.upsertSync(
-                                SharedQueueStore.QueueEntry(
-                                    adamId = adamId,
-                                    title = item.title,
-                                    status = "DOWNLOADING",
-                                    progress = 0,
-                                    hlsUrl = item.hlsUrl,
-                                )
-                            )
-                        }
+                SharedQueueStore.upsertSync(
+                    SharedQueueStore.QueueEntry(
+                        adamId = adamId,
+                        title = item.title,
+                        status = "DOWNLOADING",
+                        progress = 0,
+                        hlsUrl = item.hlsUrl,
+                    )
+                )
+            }
+            updateProgress(adamId, item.title, 0, "FAILED", e.message ?: "Unknown error")
+            showDownloadFailedNotification(ctx, item.title.ifBlank { adamId }, e.message ?: "Unknown error")
+        }
     }
 
     private data class SegmentDecryptResult(
