@@ -1,6 +1,7 @@
 package com.neurax08.xposed.appledecryptor.download
 
 import android.content.Context
+import android.util.Log
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Delete
@@ -65,34 +66,84 @@ abstract class DownloadDatabase : RoomDatabase() {
     abstract fun downloadQueueDao(): DownloadQueueDao
 
     companion object {
-        private const val SHARED_DB_DIR = "/sdcard/Music/AppleDecryptor/db"
-        private const val SHARED_DB_NAME = "appledecryptor_downloads.db"
+        private const val TAG = "AppleDecryptor"
+        private const val DB_NAME = "appledecryptor_downloads.db"
+
+        // Shared external path for cross-process access (rooted / permissioned devices).
+        private const val EXTERNAL_DB_DIR = "/sdcard/Music/AppleDecryptor/db"
 
         @Volatile
         private var INSTANCE: DownloadDatabase? = null
+        @Volatile
+        var dbPathUsed: String = "uninitialized"
+            private set
 
         /**
-         * Open a Room DB on a shared external path so the module UI process and the
-         * Apple Music hook process observe the same download queue.
+         * Opens a Room database instance.
          *
-         * Note: SQLite multi-process is best-effort. Journal mode TRUNCATE reduces concurrent writers.
+         * Strategy (fail-safe):
+         * 1. Try external /sdcard/...  path (shared across processes)
+         * 2. On SQLiteCantOpenDatabaseException (permission / scoped-storage),
+         *    fall back to the app's internal data directory.
+         *    Internal storage is per-process, so module UI and hook process
+         *    will have separate databases.
          */
         fun getInstance(context: Context): DownloadDatabase {
             return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: buildDatabase(context).also { INSTANCE = it }
+                INSTANCE ?: buildDatabase(context)
+                    .also { INSTANCE = it }
             }
         }
 
         private fun buildDatabase(context: Context): DownloadDatabase {
-            val dir = File(SHARED_DB_DIR)
-            if (!dir.exists()) {
-                dir.mkdirs()
+            val ctx = context.applicationContext
+
+            // Strategy 1: external shared path
+            val externalDb = tryExternalPath(ctx)
+            if (externalDb != null) {
+                dbPathUsed = externalDb.absolutePath
+                Log.i(TAG, "Database on external shared path: ${externalDb.absolutePath}")
+                return openDb(externalDb.absolutePath, ctx)
             }
-            val dbFile = File(dir, SHARED_DB_NAME)
+
+            // Strategy 2: internal app-private storage (always works)
+            val internalDir = File(ctx.filesDir, "appledecryptor_db")
+            if (!internalDir.exists()) {
+                internalDir.mkdirs()
+            }
+            val internalFile = File(internalDir, DB_NAME)
+            dbPathUsed = internalFile.absolutePath
+            Log.i(TAG, "Database on internal path: ${internalFile.absolutePath}")
+            return openDb(internalFile.absolutePath, ctx)
+        }
+
+        private fun tryExternalPath(ctx: Context): File? {
+            return try {
+                val dir = File(EXTERNAL_DB_DIR)
+                if (dir.exists() || dir.mkdirs()) {
+                    val dbFile = File(dir, DB_NAME)
+                    // Verify writable by attempting to create a test file
+                    val testFile = File(dir, ".db_writable_test")
+                    if (testFile.createNewFile()) {
+                        testFile.delete()
+                        dbFile
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "External DB path unavailable: ${e.message}")
+                null
+            }
+        }
+
+        private fun openDb(path: String, ctx: Context): DownloadDatabase {
             return Room.databaseBuilder(
-                context.applicationContext,
+                ctx,
                 DownloadDatabase::class.java,
-                dbFile.absolutePath,
+                path,
             )
                 .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
                 .fallbackToDestructiveMigration()

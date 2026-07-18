@@ -67,8 +67,15 @@ object DownloadManager {
         }
         applicationContext = context.applicationContext
         DownloadSettings.ensureLoaded()
-        database = DownloadDatabase.getInstance(context.applicationContext)
-        dao = database?.downloadQueueDao()
+        try {
+            database = DownloadDatabase.getInstance(context.applicationContext)
+            dao = database?.downloadQueueDao()
+            Log.i(TAG, "Database initialized at: ${DownloadDatabase.dbPathUsed}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Database init failed; downloads will be unavailable", e)
+            database = null
+            dao = null
+        }
         executorMode = asExecutor
         initialized = true
         Log.i(TAG, "DownloadManager initialized sharedDb=true executor=$asExecutor")
