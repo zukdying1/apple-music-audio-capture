@@ -1,0 +1,159 @@
+# AppleDecryptor CI — Build, Test & Artifact
+#
+# Runs on pushes to main/master, pull requests, and manual dispatch.
+# Compiles the Xposed module (Kotlin + C++ NDK), runs unit tests,
+# and uploads the signed debug APK.
+
+name: Build & Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      enable_instrumentation_tests:
+        description: "Run instrumentation tests (requires emulator)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Match the project's NDK & CMake versions declared in app/build.gradle.kts
+  NDK_VERSION: "29.0.13599879"
+  CMAKE_VERSION: "4.1.2"
+  # JDK version must match the project's jvmTarget = 17
+  JAVA_VERSION: "17"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ─── Build & Unit Test ─────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "temurin"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required SDK components
+        run: |
+          # Accept licenses (non-interactive)
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+          # Install the exact NDK and CMake versions the project expects
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install \
+            "ndk;${{ env.NDK_VERSION }}" \
+            "cmake;${{ env.CMAKE_VERSION }}" \
+            2>&1 | tail -5
+
+      - name: Strip AndroidIDE-specific Gradle properties
+        run: |
+          # Remove properties that are only valid inside the AndroidIDE sandbox
+          sed -i '/android\.aapt2FromMavenOverride/d' gradle.properties
+          echo "CI-ready gradle.properties:"
+          grep -v '^#' gradle.properties | grep -v '^$'
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle.kts', '**/libs.versions.toml', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK contents
+        run: |
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found at $APK"
+            exit 1
+          fi
+          echo "APK size: $(stat --format=%s "$APK") bytes"
+          unzip -l "$APK" | grep -E "lib/arm64-v8a/libappledecryptor\.so" || {
+            echo "WARNING: libappledecryptor.so not found in APK"
+          }
+          echo "APK verification passed"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: appledecryptor-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: app/build/reports/tests/
+          retention-days: 7
+
+  # ─── Lint & Static Analysis ─────────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "temurin"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Strip AndroidIDE-specific properties
+        run: sed -i '/android\.aapt2FromMavenOverride/d' gradle.properties
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-lint-${{ hashFiles('**/*.gradle.kts', '**/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Run lint
+        run: ./gradlew :app:lint --no-daemon --stacktrace
+
+      - name: Upload lint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: app/build/reports/lint-results*.html
+          retention-days: 7

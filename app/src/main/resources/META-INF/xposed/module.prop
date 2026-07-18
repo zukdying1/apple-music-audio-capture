@@ -1,0 +1,5 @@
+minApiVersion=101
+targetApiVersion=101
+staticScope=true
+name=AppleDecryptor
+description=Apple Music Java hook module for HLS asset request migration.

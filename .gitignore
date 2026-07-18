@@ -1,0 +1,7 @@
+.acside/
+.gradle/
+.lcm/
+.kotlin/
+build/
+app/build/
+local.properties
