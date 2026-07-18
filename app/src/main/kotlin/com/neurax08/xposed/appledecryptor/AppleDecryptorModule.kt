@@ -31,6 +31,11 @@ class AppleDecryptorModule : XposedModule() {
     private val decryptExecutor = Executors.newCachedThreadPool { runnable ->
         Thread(runnable, "AppleDecryptor-Decrypt").apply { isDaemon = true }
     }
+
+    // Captured at onPackageReady so hooks can resolve the Application context later.
+    private val packageReadyParamRef = AtomicReference<PackageReadyParam?>(null)
+    // Cached Application context, resolved once and reused.
+    private val resolvedAppContext = AtomicReference<android.content.Context?>(null)
     companion object {
         const val TAG = "AppleDecryptor"
         const val PLAYBACK_LEASE_PROXY_CLASS = "com.apple.android.music.playback.SVPlaybackLeaseManagerProxy"
@@ -53,6 +58,7 @@ class AppleDecryptorModule : XposedModule() {
 
         AppleMusicNativeBridge.setLogger { priority, message -> moduleLog(priority, TAG, message) }
         targetClassLoader.set(param.classLoader)
+        packageReadyParamRef.set(param)
 
         DownloadSettings.ensureLoaded()
 
@@ -76,7 +82,7 @@ class AppleDecryptorModule : XposedModule() {
                     } catch (_: InterruptedException) {
                         return@Thread
                     }
-                    val ctx = resolveApplicationContext(param)
+                    val ctx = resolveApplicationContext(param) ?: resolveAppContext()
                     if (ctx != null) {
                         bindDownloadStack(ctx, "deferred#$attempt")
                         return@Thread
@@ -137,13 +143,8 @@ class AppleDecryptorModule : XposedModule() {
                     lastSeenHlsUrl = hlsUrl
                     DownloadNotificationService.updateTrackInfo(adamId, "Track $adamId", "")
 
-                    // Lazy-bind Context: packageReady often had no Application yet.
-                    val liveCtx = resolveApplicationContext(param = null)
-                        ?: runCatching {
-                            Class.forName("android.app.ActivityThread")
-                                .getMethod("currentApplication")
-                                .invoke(null) as? android.content.Context
-                        }.getOrNull()
+                    // Resolve context: use cached ref, then ActivityThread, then this module.
+                    val liveCtx = resolveAppContext()
                     if (liveCtx != null && !SharedQueueStore.isInitialized()) {
                         bindDownloadStack(liveCtx, "requestAsset")
                     }
@@ -252,10 +253,98 @@ class AppleDecryptorModule : XposedModule() {
         }
 
         // Fallback: ActivityThread.currentApplication()
+        return resolveActivityThreadApp()
+    }
+
+    /** Multi-strategy context resolution for use inside hook callbacks. */
+    private fun resolveAppContext(): android.content.Context? {
+        // 1. Already cached?
+        val cached = resolvedAppContext.get()
+        if (cached != null) return cached
+
+        // 2. From stored PackageReadyParam (libxposed)
+        val param = packageReadyParamRef.get()
+        if (param != null) {
+            // Try getApplication() via reflection (libxposed API)
+            val fromParam: android.content.Context? = runCatching {
+                param.javaClass.methods
+                    .firstOrNull { it.name == "getApplication" && it.parameterCount == 0 }
+                    ?.invoke(param) as? android.content.Context
+            }.getOrNull()
+            if (fromParam != null) {
+                resolvedAppContext.compareAndSet(null, fromParam)
+                moduleLog(Log.INFO, TAG, "resolveAppContext via PackageReadyParam pkg=${fromParam.packageName}")
+                return fromParam
+            }
+            // Try getBaseContext() as fallback
+            val fromBaseCtx: android.content.Context? = runCatching {
+                param.javaClass.methods
+                    .firstOrNull { it.name == "getBaseContext" && it.parameterCount == 0 }
+                    ?.invoke(param) as? android.content.Context
+            }.getOrNull()
+            if (fromBaseCtx != null) {
+                resolvedAppContext.compareAndSet(null, fromBaseCtx)
+                moduleLog(Log.INFO, TAG, "resolveAppContext via PackageReadyParam.baseCtx pkg=${fromBaseCtx.packageName}")
+                return fromBaseCtx
+            }
+        }
+
+        // 3. ActivityThread.currentApplication() (one-step reflection)
+        val fromAt = resolveActivityThreadApp()
+        if (fromAt != null) {
+            resolvedAppContext.compareAndSet(null, fromAt)
+            moduleLog(Log.INFO, TAG, "resolveAppContext via ActivityThread pkg=${fromAt.packageName}")
+            return fromAt
+        }
+
+        // 4. ActivityThread.currentActivityThread().getApplication() (two-step, more reliable)
+        val fromAt2: android.content.Context? = runCatching {
+            val atClass = Class.forName("android.app.ActivityThread")
+            val currentAt = atClass.getMethod("currentActivityThread").invoke(null)
+            val app = currentAt?.javaClass?.getMethod("getApplication")?.invoke(currentAt)
+            app as? android.content.Context
+        }.onFailure { e ->
+            moduleLog(Log.WARN, TAG, "ActivityThread two-step failed: ${e.message}")
+        }.getOrNull()
+        if (fromAt2 != null) {
+            resolvedAppContext.compareAndSet(null, fromAt2)
+            moduleLog(Log.INFO, TAG, "resolveAppContext via ActivityThread.twoStep pkg=${fromAt2.packageName}")
+            return fromAt2
+        }
+
+        // 5. Module self: try as Context, then unwrap ContextWrapper to get app context
+        runCatching {
+            val moduleCtx = (this as? android.content.Context)?.let { ctx ->
+                // ModuleContext is a ContextWrapper; unwrap to get real app context
+                var current = ctx
+                while (current is android.content.ContextWrapper) {
+                    val base = current.baseContext
+                    if (base == null || base == current) break
+                    current = base
+                }
+                current
+            }
+            if (moduleCtx != null) {
+                val appCtx = moduleCtx.applicationContext
+                resolvedAppContext.compareAndSet(null, appCtx)
+                moduleLog(Log.INFO, TAG, "resolveAppContext via moduleSelf pkg=${appCtx.packageName}")
+                return appCtx
+            }
+        }.onFailure { e ->
+            moduleLog(Log.WARN, TAG, "resolveAppContext via moduleSelf failed", e)
+        }
+
+        moduleLog(Log.WARN, TAG, "resolveAppContext FAILED all strategies")
+        return null
+    }
+
+    private fun resolveActivityThreadApp(): android.content.Context? {
         return runCatching {
             val activityThreadClass = Class.forName("android.app.ActivityThread")
             val currentApp = activityThreadClass.getMethod("currentApplication").invoke(null)
             currentApp as? android.content.Context
+        }.onFailure { e ->
+            moduleLog(Log.WARN, TAG, "ActivityThread.currentApplication() failed: ${e.message}")
         }.getOrNull()
     }
 

@@ -1,27 +1,35 @@
 package com.neurax08.xposed.appledecryptor.download
 
-import android.content.ContentValues
+import android.content.ComponentName
 import android.content.Context
-import android.database.Cursor
-import android.net.Uri
+import android.content.Intent
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 /**
- * Cross-process queue facade.
+ * Cross-process queue.
  *
- * Primary backend: [QueueContentProvider] (module private storage).
- * Hook process writes via ContentResolver; UI reads the same provider.
+ * Write path (hook / host process):
+ *   1) Explicit broadcast → module [QueueSyncReceiver] (primary, works Android 11+)
+ *   2) ContentProvider insert (best-effort secondary)
  *
- * Critical for Xposed: [init] may not run at package-ready time because
- * Application Context is often null then. Every public API calls [ensureInit]
- * and resolves Context via ActivityThread / optional seed Context.
+ * Read path (module UI process):
+ *   Local filesDir/queue.json written by receiver / provider.
+ *
+ * Never depends on /sdcard.
  */
 object SharedQueueStore {
     private const val TAG = "AppleDecryptor"
-    private const val MODULE_PACKAGE = "com.neurax08.xposed.appledecryptor"
+    private const val FILE_NAME = "queue.json"
+    private const val MAX_ITEMS = 200
 
     data class QueueEntry(
         val adamId: String,
@@ -38,6 +46,7 @@ object SharedQueueStore {
     )
 
     private val appContextRef = AtomicReference<Context?>(null)
+    private val lock = ReentrantReadWriteLock()
 
     @Volatile
     var lastError: String = ""
@@ -49,147 +58,257 @@ object SharedQueueStore {
     fun init(context: Context) {
         val app = runCatching { context.applicationContext }.getOrNull() ?: context
         appContextRef.set(app)
-        backendLabel = "content://${QueueContentProvider.AUTHORITY}"
+        backendLabel = "local:${File(app.filesDir, FILE_NAME).absolutePath}"
         lastError = ""
         Log.i(TAG, "SharedQueueStore init package=${app.packageName} backend=$backendLabel")
     }
 
-    /**
-     * Lazily resolve Application Context if [init] never ran or ran too early.
-     * Safe to call from hook threads in the host process.
-     */
     fun ensureInit(seed: Context? = null): Boolean {
         if (appContextRef.get() != null) return true
-
         val fromSeed = seed?.let { runCatching { it.applicationContext }.getOrNull() ?: it }
         if (fromSeed != null) {
             init(fromSeed)
             return true
         }
-
         val fromAt = resolveActivityThreadApplication()
         if (fromAt != null) {
             init(fromAt)
             return true
         }
-
-        // Last resort: module package context (for ContentResolver only).
-        val moduleCtx = resolveModuleContext(fromAt)
-        if (moduleCtx != null) {
-            init(moduleCtx)
-            return true
-        }
-
-        lastError = "upsert skipped: SharedQueueStore not initialized (no Application Context yet)"
+        lastError = "SharedQueueStore not initialized (no Application Context)"
         backendLabel = "uninitialized"
         Log.w(TAG, lastError)
         return false
     }
 
     fun getActivePath(): String = backendLabel
-
     fun isInitialized(): Boolean = appContextRef.get() != null
 
     private fun ctx(): Context? = appContextRef.get()
 
     private fun resolveActivityThreadApplication(): Context? {
         return runCatching {
-            val activityThreadClass = Class.forName("android.app.ActivityThread")
-            val currentApp = activityThreadClass.getMethod("currentApplication").invoke(null)
-            currentApp as? Context
-        }.onFailure { e ->
-            Log.w(TAG, "ActivityThread.currentApplication failed: ${e.message}")
+            val cls = Class.forName("android.app.ActivityThread")
+            cls.getMethod("currentApplication").invoke(null) as? Context
         }.getOrNull()
     }
 
-    private fun resolveModuleContext(base: Context?): Context? {
-        val host = base ?: resolveActivityThreadApplication() ?: return null
-        return runCatching {
-            host.createPackageContext(
-                MODULE_PACKAGE,
-                Context.CONTEXT_INCLUDE_CODE or Context.CONTEXT_IGNORE_SECURITY,
-            )
-        }.onFailure { e ->
-            Log.w(TAG, "createPackageContext($MODULE_PACKAGE) failed: ${e.message}")
-        }.getOrNull()
+    private fun queueFile(context: Context): File = File(context.filesDir, FILE_NAME)
+
+    // ---------- local file CRUD (module process / after broadcast) ----------
+
+    fun applyLocalUpsert(entry: QueueEntry) {
+        if (entry.adamId.isBlank()) return
+        if (!ensureInit()) return
+        val context = ctx() ?: return
+        lock.write {
+            val items = readAllLocked(context)
+            val idx = items.indexOfFirst { it.optString("adamId") == entry.adamId }
+            val merged = if (idx >= 0) {
+                mergeEntry(items[idx], entry)
+            } else {
+                entryToJson(entry)
+            }
+            if (idx >= 0) items[idx] = merged else items.add(0, merged)
+            while (items.size > MAX_ITEMS) items.removeAt(items.lastIndex)
+            writeAllLocked(context, items)
+            backendLabel = "local:${queueFile(context).absolutePath} (${items.size} items)"
+            lastError = ""
+        }
+        Log.i(TAG, "queue local upsert adamId=${entry.adamId} status=${entry.status}")
     }
+
+    fun applyLocalDelete(adamId: String) {
+        if (adamId.isBlank()) return
+        if (!ensureInit()) return
+        val context = ctx() ?: return
+        lock.write {
+            val items = readAllLocked(context)
+            val before = items.size
+            items.removeAll { it.optString("adamId") == adamId }
+            if (items.size != before) {
+                writeAllLocked(context, items)
+            }
+            lastError = ""
+        }
+    }
+
+    private fun readAllLocked(context: Context): MutableList<JSONObject> {
+        val f = queueFile(context)
+        if (!f.exists() || f.length() == 0L) return mutableListOf()
+        return try {
+            val arr = JSONArray(f.readText())
+            MutableList(arr.length()) { arr.getJSONObject(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "queue file read failed: ${e.message}")
+            mutableListOf()
+        }
+    }
+
+    private fun writeAllLocked(context: Context, items: List<JSONObject>) {
+        val arr = JSONArray()
+        items.forEach { arr.put(it) }
+        val f = queueFile(context)
+        val tmp = File(context.filesDir, "$FILE_NAME.tmp")
+        tmp.writeText(arr.toString())
+        if (!tmp.renameTo(f)) {
+            f.writeText(arr.toString())
+            tmp.delete()
+        }
+    }
+
+    private fun entryToJson(e: QueueEntry): JSONObject {
+        return JSONObject()
+            .put("adamId", e.adamId)
+            .put("title", e.title)
+            .put("artist", e.artist)
+            .put("status", e.status)
+            .put("progress", e.progress)
+            .put("filePath", e.filePath)
+            .put("createdAt", e.createdAt)
+            .put("errorMessage", e.errorMessage)
+            .put("hlsUrl", e.hlsUrl)
+            .put("totalSegments", e.totalSegments)
+            .put("completedSegments", e.completedSegments)
+    }
+
+    private fun mergeEntry(existing: JSONObject, e: QueueEntry): JSONObject {
+        fun putStr(key: String, value: String, overwriteBlank: Boolean = false) {
+            if (value.isNotBlank() || overwriteBlank || !existing.has(key)) {
+                if (value.isNotBlank() || overwriteBlank) existing.put(key, value)
+            }
+        }
+        // Always update status/progress fields when provided by writer.
+        if (e.status.isNotBlank()) existing.put("status", e.status)
+        existing.put("progress", e.progress)
+        putStr("title", e.title)
+        putStr("artist", e.artist)
+        putStr("filePath", e.filePath)
+        putStr("errorMessage", e.errorMessage, overwriteBlank = e.status != "FAILED")
+        putStr("hlsUrl", e.hlsUrl)
+        if (e.totalSegments > 0) existing.put("totalSegments", e.totalSegments)
+        if (e.completedSegments > 0) existing.put("completedSegments", e.completedSegments)
+        if (!existing.has("createdAt") || existing.optLong("createdAt") == 0L) {
+            existing.put("createdAt", e.createdAt)
+        }
+        if (!existing.has("adamId")) existing.put("adamId", e.adamId)
+        return existing
+    }
+
+    private fun jsonToEntry(obj: JSONObject): QueueEntry {
+        return QueueEntry(
+            adamId = obj.optString("adamId", ""),
+            title = obj.optString("title", ""),
+            artist = obj.optString("artist", ""),
+            status = obj.optString("status", "QUEUED"),
+            progress = obj.optInt("progress", 0),
+            filePath = obj.optString("filePath", ""),
+            createdAt = obj.optLong("createdAt", System.currentTimeMillis()),
+            errorMessage = obj.optString("errorMessage", ""),
+            hlsUrl = obj.optString("hlsUrl", ""),
+            totalSegments = obj.optInt("totalSegments", 0),
+            completedSegments = obj.optInt("completedSegments", 0),
+        )
+    }
+
+    // ---------- public API ----------
 
     suspend fun load(): List<QueueEntry> = withContext(Dispatchers.IO) { loadSync() }
 
     fun loadSync(): List<QueueEntry> {
-        if (!ensureInit()) {
-            return emptyList()
-        }
-        val context = ctx()
-        if (context == null) {
-            lastError = "SharedQueueStore not initialized (no Context)"
-            Log.w(TAG, lastError)
-            return emptyList()
-        }
-        return try {
-            val list = ArrayList<QueueEntry>()
-            context.contentResolver.query(
-                QueueContentProvider.CONTENT_URI,
-                QueueContentProvider.COLUMNS,
-                null,
-                null,
-                "createdAt DESC",
-            )?.use { cursor ->
-                while (cursor.moveToNext()) {
-                    list.add(cursorToEntry(cursor))
-                }
-            } ?: run {
-                // null cursor often means provider missing / permission
-                lastError = "query returned null cursor (provider missing or blocked?)"
-                Log.w(TAG, lastError)
-            }
-            if (lastError.isEmpty() || lastError.startsWith("query returned")) {
-                // keep query-null error if set
-            }
-            if (list.isNotEmpty() || lastError.isEmpty()) {
+        if (!ensureInit()) return emptyList()
+        val context = ctx() ?: return emptyList()
+        return lock.read {
+            try {
+                val list = readAllLocked(context).map { jsonToEntry(it) }
+                    .sortedByDescending { it.createdAt }
+                backendLabel = "local:${queueFile(context).absolutePath} (${list.size} items)"
                 lastError = ""
+                Log.i(TAG, "queue load size=${list.size} package=${context.packageName}")
+                list
+            } catch (e: Exception) {
+                lastError = "load failed: ${e.message}"
+                Log.e(TAG, lastError, e)
+                emptyList()
             }
-            backendLabel = "content://${QueueContentProvider.AUTHORITY} (${list.size} items)"
-            Log.i(TAG, "queue load size=${list.size} via package=${context.packageName}")
-            list
-        } catch (e: Exception) {
-            lastError = "load failed: ${e.javaClass.simpleName}: ${e.message}"
-            Log.e(TAG, lastError, e)
-            emptyList()
         }
     }
 
     suspend fun upsert(entry: QueueEntry) = withContext(Dispatchers.IO) { upsertSync(entry) }
 
+    /**
+     * Cross-process safe upsert.
+     * Host process → broadcast to module package; if we ARE the module package, write local.
+     */
     fun upsertSync(entry: QueueEntry, seedContext: Context? = null) {
         if (entry.adamId.isBlank()) return
         if (!ensureInit(seedContext)) {
             Log.w(TAG, "queue upsert aborted adamId=${entry.adamId} err=$lastError")
             return
         }
-        val context = ctx()
-        if (context == null) {
-            lastError = "upsert skipped: SharedQueueStore not initialized"
-            Log.w(TAG, lastError)
-            return
+        val context = ctx() ?: return
+        val pkg = context.packageName
+
+        // Always write local if we are the module process (UI / receiver).
+        if (pkg == QueueSyncReceiver.MODULE_PACKAGE) {
+            applyLocalUpsert(entry)
         }
-        try {
-            val values = QueueContentProvider.entryToValues(entry)
-            val uri = context.contentResolver.insert(QueueContentProvider.CONTENT_URI, values)
-            if (uri == null) {
-                lastError = "insert returned null uri (provider rejected?)"
-                Log.e(TAG, "queue upsert adamId=${entry.adamId} $lastError")
-                return
-            }
-            lastError = ""
-            backendLabel = "content://${QueueContentProvider.AUTHORITY}"
+
+        // Always broadcast to module so UI process sees updates from host.
+        val broadcastOk = sendUpsertBroadcast(context, entry)
+
+        // Best-effort ContentProvider (may fail on package visibility).
+        val providerOk = tryProviderInsert(context, entry)
+
+        if (!broadcastOk && !providerOk && pkg != QueueSyncReceiver.MODULE_PACKAGE) {
+            lastError = "cross-process write failed (broadcast+provider). Is module APK installed?"
+            Log.e(TAG, lastError)
+        } else {
+            if (lastError.startsWith("cross-process")) lastError = ""
             Log.i(
                 TAG,
-                "queue upsert adamId=${entry.adamId} status=${entry.status} uri=$uri via=${context.packageName}",
+                "queue upsert adamId=${entry.adamId} status=${entry.status} " +
+                    "broadcast=$broadcastOk provider=$providerOk localPkg=$pkg",
             )
+        }
+    }
+
+    private fun sendUpsertBroadcast(context: Context, entry: QueueEntry): Boolean {
+        return try {
+            val intent = Intent(QueueSyncReceiver.ACTION_UPSERT).apply {
+                component = ComponentName(
+                    QueueSyncReceiver.MODULE_PACKAGE,
+                    QueueSyncReceiver.RECEIVER_CLASS,
+                )
+                setPackage(QueueSyncReceiver.MODULE_PACKAGE)
+                putExtra(QueueSyncReceiver.EXTRA_ADAM_ID, entry.adamId)
+                putExtra(QueueSyncReceiver.EXTRA_TITLE, entry.title)
+                putExtra(QueueSyncReceiver.EXTRA_ARTIST, entry.artist)
+                putExtra(QueueSyncReceiver.EXTRA_STATUS, entry.status)
+                putExtra(QueueSyncReceiver.EXTRA_PROGRESS, entry.progress)
+                putExtra(QueueSyncReceiver.EXTRA_FILE_PATH, entry.filePath)
+                putExtra(QueueSyncReceiver.EXTRA_CREATED_AT, entry.createdAt)
+                putExtra(QueueSyncReceiver.EXTRA_ERROR, entry.errorMessage)
+                putExtra(QueueSyncReceiver.EXTRA_HLS_URL, entry.hlsUrl)
+                putExtra(QueueSyncReceiver.EXTRA_TOTAL, entry.totalSegments)
+                putExtra(QueueSyncReceiver.EXTRA_DONE, entry.completedSegments)
+            }
+            context.sendBroadcast(intent)
+            true
         } catch (e: Exception) {
-            lastError = "upsert failed: ${e.javaClass.simpleName}: ${e.message}"
-            Log.e(TAG, lastError, e)
+            Log.w(TAG, "broadcast upsert failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tryProviderInsert(context: Context, entry: QueueEntry): Boolean {
+        return try {
+            val values = QueueContentProvider.entryToValues(entry)
+            val uri = context.contentResolver.insert(QueueContentProvider.CONTENT_URI, values)
+            uri != null
+        } catch (e: Exception) {
+            Log.w(TAG, "provider upsert failed: ${e.message}")
+            false
         }
     }
 
@@ -198,64 +317,32 @@ object SharedQueueStore {
     fun deleteSync(adamId: String) {
         if (!ensureInit()) return
         val context = ctx() ?: return
+        if (context.packageName == QueueSyncReceiver.MODULE_PACKAGE) {
+            applyLocalDelete(adamId)
+        }
         try {
-            val uri = Uri.withAppendedPath(QueueContentProvider.CONTENT_URI, adamId)
-            context.contentResolver.delete(uri, null, null)
-            lastError = ""
+            val intent = Intent(QueueSyncReceiver.ACTION_DELETE).apply {
+                component = ComponentName(
+                    QueueSyncReceiver.MODULE_PACKAGE,
+                    QueueSyncReceiver.RECEIVER_CLASS,
+                )
+                setPackage(QueueSyncReceiver.MODULE_PACKAGE)
+                putExtra(QueueSyncReceiver.EXTRA_ADAM_ID, adamId)
+            }
+            context.sendBroadcast(intent)
         } catch (e: Exception) {
-            lastError = "delete failed: ${e.javaClass.simpleName}: ${e.message}"
-            Log.e(TAG, lastError, e)
+            Log.w(TAG, "broadcast delete failed: ${e.message}")
+        }
+        try {
+            val uri = android.net.Uri.withAppendedPath(QueueContentProvider.CONTENT_URI, adamId)
+            context.contentResolver.delete(uri, null, null)
+        } catch (_: Exception) {
         }
     }
 
     suspend fun get(adamId: String): QueueEntry? = withContext(Dispatchers.IO) {
-        if (!ensureInit()) return@withContext null
-        val context = ctx() ?: return@withContext null
-        try {
-            val uri = Uri.withAppendedPath(QueueContentProvider.CONTENT_URI, adamId)
-            context.contentResolver.query(
-                uri,
-                QueueContentProvider.COLUMNS,
-                null,
-                null,
-                null,
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) cursorToEntry(cursor) else null
-            }
-        } catch (e: Exception) {
-            lastError = "get failed: ${e.javaClass.simpleName}: ${e.message}"
-            Log.e(TAG, lastError, e)
-            null
-        }
+        loadSync().firstOrNull { it.adamId == adamId }
     }
 
     fun snapshot(): List<QueueEntry> = loadSync()
-
-    private fun cursorToEntry(cursor: Cursor): QueueEntry {
-        fun str(col: String): String {
-            val i = cursor.getColumnIndex(col)
-            return if (i >= 0) cursor.getString(i) ?: "" else ""
-        }
-        fun int(col: String): Int {
-            val i = cursor.getColumnIndex(col)
-            return if (i >= 0) cursor.getInt(i) else 0
-        }
-        fun long(col: String): Long {
-            val i = cursor.getColumnIndex(col)
-            return if (i >= 0) cursor.getLong(i) else 0L
-        }
-        return QueueEntry(
-            adamId = str("adamId"),
-            title = str("title"),
-            artist = str("artist"),
-            status = str("status"),
-            progress = int("progress"),
-            filePath = str("filePath"),
-            createdAt = long("createdAt"),
-            errorMessage = str("errorMessage"),
-            hlsUrl = str("hlsUrl"),
-            totalSegments = int("totalSegments"),
-            completedSegments = int("completedSegments"),
-        )
-    }
 }

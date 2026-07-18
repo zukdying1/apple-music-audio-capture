@@ -14,9 +14,10 @@ object DownloadSettings {
     private const val SETTINGS_DIR = "/sdcard/Music/AppleDecryptor"
     private const val SETTINGS_FILE = "settings.json"
 
-    // Defaults match design: auto-detect can enqueue; sockets kept for compatibility.
-    private val autoDownload = AtomicBoolean(true)
-    private val keepSocketServers = AtomicBoolean(true)
+    // Defaults: auto-download OFF to avoid heap OOM from concurrent full-track buffers.
+    // User can enable after confirming queue IPC works. Sample-level decrypt stays on.
+    private val autoDownload = AtomicBoolean(false)
+    private val keepSocketServers = AtomicBoolean(false)
     private val preferSampleLevelDecrypt = AtomicBoolean(true)
 
     @Volatile
@@ -73,8 +74,8 @@ object DownloadSettings {
                 return
             }
             val json = JSONObject(file.readText())
-            autoDownload.set(json.optBoolean("autoDownload", true))
-            keepSocketServers.set(json.optBoolean("keepSocketServers", true))
+            autoDownload.set(json.optBoolean("autoDownload", false))
+            keepSocketServers.set(json.optBoolean("keepSocketServers", false))
             preferSampleLevelDecrypt.set(json.optBoolean("preferSampleLevelDecrypt", true))
             Log.i(
                 TAG,

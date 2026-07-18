@@ -13,6 +13,17 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+
+    <!-- Android 11+ package visibility: host process can resolve module components. -->
+    <queries>
+        <package android:name="com.neurax08.xposed.appledecryptor" />
+        <package android:name="com.apple.android.music" />
+        <intent>
+            <action android:name="com.neurax08.xposed.appledecryptor.action.QUEUE_UPSERT" />
+        </intent>
+        <provider android:authorities="com.neurax08.xposed.appledecryptor.queue" />
+    </queries>
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -39,5 +50,16 @@
             android:authorities="com.neurax08.xposed.appledecryptor.queue"
             android:exported="true"
             android:grantUriPermissions="true" />
+        <!-- Explicit broadcast target for host → module queue sync (Android 11+ safe). -->
+        <receiver
+            android:name=".download.QueueSyncReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="com.neurax08.xposed.appledecryptor.action.QUEUE_UPSERT" />
+                <action android:name="com.neurax08.xposed.appledecryptor.action.QUEUE_DELETE" />
+                <action android:name="com.neurax08.xposed.appledecryptor.action.QUEUE_PING" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

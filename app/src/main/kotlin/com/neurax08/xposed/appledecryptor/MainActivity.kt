@@ -457,7 +457,7 @@ fun SettingsTab() {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            text = "ContentProvider content://com.neurax08.xposed.appledecryptor.queue — hook writes, UI polls every 3s.",
+            text = "Host → explicit Broadcast QueueSyncReceiver → module filesDir/queue.json (Android 11+ safe). ContentProvider is secondary.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

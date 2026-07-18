@@ -134,17 +134,15 @@ object DownloadManager {
 
             // Also persist to shared cross-process queue (visible to UI).
             runCatching {
-                kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
-                    SharedQueueStore.upsert(
-                        SharedQueueStore.QueueEntry(
-                            adamId = adamId,
-                            title = title.ifBlank { item.title },
-                            artist = artist,
-                            status = "QUEUED",
-                            hlsUrl = hlsUrl.ifBlank { item.hlsUrl },
-                        )
+                SharedQueueStore.upsertSync(
+                    SharedQueueStore.QueueEntry(
+                        adamId = adamId,
+                        title = title.ifBlank { item.title },
+                        artist = artist,
+                        status = "QUEUED",
+                        hlsUrl = hlsUrl.ifBlank { item.hlsUrl },
                     )
-                }
+                )
             }
 
             // Only the Apple Music process can actually decrypt/download.
@@ -296,10 +294,13 @@ object DownloadManager {
             }
 
             val preferSampleLevel = DownloadSettings.isPreferSampleLevelDecrypt()
-            val trackInfos = mutableListOf<TrackInfo>()
-            val allSamples = mutableListOf<AudioSample>()
             var presentationCursorUs = 0L
+            var sampleCount = 0
+            var writerReady = false
+            val title = item.title.ifBlank { "Track_$adamId" }
 
+            // Stream each segment → decrypt → write immediately.
+            // NEVER accumulate all samples in heap (was OOM at 512MB).
             for ((index, segment) in segments.withIndex()) {
                 if (!isJobActive(adamId)) {
                     dao?.update(item.copy(status = "CANCELED"))
@@ -319,12 +320,34 @@ object DownloadManager {
                             preferSampleLevel = preferSampleLevel,
                             presentationCursorUs = presentationCursorUs,
                         )
-                        produced.trackInfo?.let { trackInfos.add(it) }
-                        allSamples.addAll(produced.samples)
+
+                        if (!writerReady) {
+                            val trackInfo = produced.trackInfo ?: TrackInfo(
+                                mime = "audio/alac",
+                                sampleRate = 44100,
+                                channelCount = 2,
+                                csd0 = null,
+                                durationUs = 0L,
+                            )
+                            if (!m4aWriter.init(title, trackInfo)) {
+                                val reason = m4aWriter.getInitError() ?: "MediaMuxer ALAC unavailable"
+                                throw Exception(
+                                    "Failed to create M4A (ALAC). WAV fallback disabled for compressed audio. $reason",
+                                )
+                            }
+                            writerReady = true
+                        }
+
+                        for (sample in produced.samples) {
+                            m4aWriter.writeSample(sample)
+                            sampleCount++
+                        }
                         if (produced.samples.isNotEmpty()) {
                             val last = produced.samples.last()
-                            presentationCursorUs = last.presentationTimeUs + last.durationUs.coerceAtLeast(0L)
+                            presentationCursorUs =
+                                last.presentationTimeUs + last.durationUs.coerceAtLeast(0L)
                         }
+                        // Drop references ASAP for GC.
                         segmentSuccess = true
                     } catch (e: Exception) {
                         segmentRetries++
@@ -338,48 +361,33 @@ object DownloadManager {
                 val progress = ((index + 1) * 100) / segments.size
                 dao?.update(item.copy(progress = progress, completedSegments = index + 1))
                 runCatching {
-                    SharedQueueStore.upsertSync(
-                        SharedQueueStore.QueueEntry(
-                            adamId = adamId,
-                            title = item.title,
-                            status = "DOWNLOADING",
-                            progress = progress,
-                            totalSegments = segments.size,
-                            completedSegments = index + 1,
-                            hlsUrl = item.hlsUrl,
-                        )
-                    )
-                }
+                                    SharedQueueStore.upsertSync(
+                                        SharedQueueStore.QueueEntry(
+                                            adamId = adamId,
+                                            title = item.title,
+                                            status = "DOWNLOADING",
+                                            progress = progress,
+                                            totalSegments = segments.size,
+                                            completedSegments = index + 1,
+                                            hlsUrl = item.hlsUrl,
+                                        )
+                                    )
+                                }
                 updateProgress(adamId, item.title, progress, "DOWNLOADING")
+                // Hint GC between segments to keep heap free for next fMP4.
+                if (index % 4 == 3) {
+                    System.gc()
+                }
             }
 
-            if (allSamples.isEmpty()) {
+            if (!writerReady || sampleCount == 0) {
                 throw Exception("No audio samples produced after decrypt")
             }
 
-            val title = item.title.ifBlank { "Track_$adamId" }
-            val trackInfo = trackInfos.firstOrNull() ?: TrackInfo(
-                mime = "audio/alac",
-                sampleRate = 44100,
-                channelCount = 2,
-                csd0 = null,
-                durationUs = 0L,
-            )
-
-            if (!m4aWriter.init(title, trackInfo)) {
-                val reason = m4aWriter.getInitError() ?: "MediaMuxer ALAC unavailable"
-                throw Exception(
-                    "Failed to create M4A (ALAC). WAV fallback is disabled for compressed audio. $reason",
-                )
-            }
-
-            for (sample in allSamples) {
-                m4aWriter.writeSample(sample)
-            }
             val outputPath = m4aWriter.finish()
                 ?: throw Exception("Failed to finalize output file")
 
-            Log.i(TAG, "Download complete adamId=$adamId path=$outputPath samples=${allSamples.size}")
+            Log.i(TAG, "Download complete adamId=$adamId path=$outputPath samples=$sampleCount")
             dao?.update(
                 item.copy(
                     status = "COMPLETED",
@@ -388,17 +396,15 @@ object DownloadManager {
                 ),
             )
             runCatching {
-                kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
-                    SharedQueueStore.upsert(
-                        SharedQueueStore.QueueEntry(
-                            adamId = adamId,
-                            title = item.title,
-                            status = "COMPLETED",
-                            progress = 100,
-                            filePath = outputPath,
-                        )
-                    )
-                }
+                SharedQueueStore.upsertSync(
+                    SharedQueueStore.QueueEntry(
+                        adamId = adamId,
+                        title = item.title,
+                        status = "COMPLETED",
+                        progress = 100,
+                        filePath = outputPath,
+                    ),
+                )
             }
             updateProgress(adamId, item.title, 100, "COMPLETED")
             showDownloadCompleteNotification(ctx, title, outputPath)
@@ -411,23 +417,16 @@ object DownloadManager {
                 ),
             )
             runCatching {
-                kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
-                    val entry = SharedQueueStore.get(adamId)
-                    SharedQueueStore.upsert(
-                        entry?.copy(
-                            status = "FAILED",
-                            errorMessage = e.message ?: "Unknown error",
-                        ) ?: SharedQueueStore.QueueEntry(
-                            adamId = adamId,
-                            status = "FAILED",
-                            errorMessage = e.message ?: "Unknown error",
-                        )
-                    )
-                }
-            }
-            updateProgress(adamId, item.title, 0, "FAILED", e.message ?: "Unknown error")
-            showDownloadFailedNotification(ctx, item.title.ifBlank { adamId }, e.message ?: "Unknown error")
-        }
+                            SharedQueueStore.upsertSync(
+                                SharedQueueStore.QueueEntry(
+                                    adamId = adamId,
+                                    title = item.title,
+                                    status = "DOWNLOADING",
+                                    progress = 0,
+                                    hlsUrl = item.hlsUrl,
+                                )
+                            )
+                        }
     }
 
     private data class SegmentDecryptResult(
@@ -600,7 +599,7 @@ object DownloadManager {
                 }
                 // Update shared queue
                 runCatching {
-                    SharedQueueStore.upsert(
+                    SharedQueueStore.upsertSync(
                         SharedQueueStore.QueueEntry(
                             adamId = adamId,
                             title = existing.title,
@@ -628,7 +627,7 @@ object DownloadManager {
             )
             // Shared queue
             runCatching {
-                SharedQueueStore.upsert(
+                SharedQueueStore.upsertSync(
                     SharedQueueStore.QueueEntry(
                         adamId = adamId,
                         title = "Track $adamId",
