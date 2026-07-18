@@ -208,6 +208,19 @@ class AppleDecryptorModule : XposedModule() {
     }
 
     private fun bindDownloadStack(appContext: android.content.Context, source: String) {
+        // Store module context for notification resource lookups.
+        // The appContext is the host process; safeString() handles resource misses.
+        runCatching {
+            DownloadNotificationService.initModuleContext(appContext)
+            moduleLog(
+                Log.INFO,
+                TAG,
+                "DownloadNotificationService.initModuleContext source=$source pkg=${appContext.packageName}",
+            )
+        }.onFailure { error ->
+            moduleLog(Log.WARN, TAG, "initModuleContext failed source=$source", error)
+        }
+
         runCatching {
             SharedQueueStore.init(appContext)
             moduleLog(
