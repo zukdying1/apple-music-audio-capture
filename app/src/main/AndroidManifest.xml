@@ -33,5 +33,11 @@
             android:name=".download.DownloadNotificationService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
+        <!-- Cross-process queue: Apple Music hook writes here; module UI reads. -->
+        <provider
+            android:name=".download.QueueContentProvider"
+            android:authorities="com.neurax08.xposed.appledecryptor.queue"
+            android:exported="true"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>

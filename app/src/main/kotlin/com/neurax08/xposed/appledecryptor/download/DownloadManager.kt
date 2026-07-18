@@ -67,6 +67,7 @@ object DownloadManager {
         }
         applicationContext = context.applicationContext
         DownloadSettings.ensureLoaded()
+        SharedQueueStore.init(context.applicationContext)
         try {
             database = DownloadDatabase.getInstance(context.applicationContext)
             dao = database?.downloadQueueDao()

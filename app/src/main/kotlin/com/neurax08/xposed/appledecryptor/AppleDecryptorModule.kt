@@ -59,6 +59,14 @@ class AppleDecryptorModule : XposedModule() {
         // Resolve application context from PackageReadyParam (libxposed) or ActivityThread fallback.
         val appContext = resolveApplicationContext(param)
         if (appContext != null) {
+            // Shared queue via ContentProvider (module private storage, cross-process safe).
+            runCatching {
+                SharedQueueStore.init(appContext)
+                moduleLog(Log.INFO, TAG, "SharedQueueStore init backend=${SharedQueueStore.getActivePath()}")
+            }.onFailure { error ->
+                moduleLog(Log.WARN, TAG, "SharedQueueStore init failed", error)
+            }
+
             runCatching {
                 // Executor mode: only this process has libandroidappmusic + native decrypt.
                 DownloadManager.init(appContext, asExecutor = true)

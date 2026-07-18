@@ -62,7 +62,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DownloadSettings.ensureLoaded()
-        // UI process only observes/enqueues shared DB. Downloads run in Apple Music process.
+        // ContentProvider-backed queue — same backend as the Apple Music hook process.
+        SharedQueueStore.init(applicationContext)
+        // UI process only observes/enqueues. Downloads run in Apple Music process.
         DownloadManager.init(applicationContext, asExecutor = false)
         enableEdgeToEdge()
         setContent {
@@ -445,7 +447,7 @@ fun SettingsTab() {
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "Shared Queue File",
+            text = "Shared Queue Backend",
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.Medium,
         )
@@ -455,7 +457,7 @@ fun SettingsTab() {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(
-            text = "Hook process writes this JSON file; UI process polls it every 3s. Fallback: /data/local/tmp/appledecryptor_queue.json",
+            text = "ContentProvider content://com.neurax08.xposed.appledecryptor.queue — hook writes, UI polls every 3s.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
