@@ -16,7 +16,13 @@ else()
 endif()
 
 set(ANDROID_RUNTIME_LIB_DIR "${ANDROID_NDK}/toolchains/llvm/prebuilt/${HOST_TAG}/sysroot/usr/lib/aarch64-linux-android")
-set(CMAKE_CXX_LINK_EXECUTABLE "${CMAKE_C_COMPILER} <FLAGS> <CMAKE_CXX_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
+
+# We use -DANDROID_STL=c++_static from Gradle.
+# The NDK toolchain adds -isystem for headers and -lc++_static for linking,
+# but the custom CMAKE_CXX_LINK_EXECUTABLE only affects executables (not SHARED).
+# For safety, add the c++_static path explicitly.
+set(CXX_STATIC_LIB "${ANDROID_NDK}/toolchains/llvm/prebuilt/${HOST_TAG}/sysroot/usr/lib/aarch64-linux-android/libc++_static.a")
+
 add_library(appledecryptor SHARED appledecryptor.cpp)
 
 target_link_options(
@@ -24,8 +30,14 @@ target_link_options(
     PRIVATE
     "-L${ANDROID_RUNTIME_LIB_DIR}/32"
     "-L${ANDROID_RUNTIME_LIB_DIR}"
+    "-Wl,--gc-sections"
 )
 
 find_library(log-lib log)
 
-target_link_libraries(appledecryptor ${log-lib})
+if(EXISTS "${CXX_STATIC_LIB}")
+    target_link_libraries(appledecryptor ${log-lib} "${CXX_STATIC_LIB}")
+else()
+    # Fallback: rely on NDK toolchain -lc++_static via ANDROID_STL
+    target_link_libraries(appledecryptor ${log-lib})
+endif()

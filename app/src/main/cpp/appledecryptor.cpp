@@ -19,6 +19,7 @@ constexpr size_t kMaxNativeLogLength = 256;
 
 // Global state lock — recursive to allow nested locking from
 // resolveSymbols -> openTargetLibrary call chain.
+// Requires -DANDROID_STL=c++_static (build.gradle.kts defaultConfig.cmake.arguments).
 std::recursive_mutex gGlobalLock;
 #define LOCK_GLOBAL() std::lock_guard<std::recursive_mutex> _lock(gGlobalLock)
 
