@@ -407,7 +407,7 @@ object DownloadManager {
                 )
             }
             updateProgress(adamId, item.title, 100, "COMPLETED")
-            showDownloadCompleteNotification(ctx, title, outputPath)
+            runCatching { showDownloadCompleteNotification(ctx, title, outputPath) }
         } catch (e: Exception) {
             Log.e(TAG, "Download failed adamId=$adamId: ${e.message}", e)
             dao?.update(
@@ -421,14 +421,24 @@ object DownloadManager {
                     SharedQueueStore.QueueEntry(
                         adamId = adamId,
                         title = item.title,
-                        status = "DOWNLOADING",
-                        progress = 0,
+                        artist = item.artist,
+                        status = "FAILED",
+                        errorMessage = e.message ?: "Unknown error",
                         hlsUrl = item.hlsUrl,
                     )
                 )
             }
             updateProgress(adamId, item.title, 0, "FAILED", e.message ?: "Unknown error")
-            showDownloadFailedNotification(ctx, item.title.ifBlank { adamId }, e.message ?: "Unknown error")
+            // Never let notification resource lookup crash the host process.
+            runCatching {
+                showDownloadFailedNotification(
+                    ctx,
+                    item.title.ifBlank { adamId },
+                    e.message ?: "Unknown error",
+                )
+            }.onFailure { ne ->
+                Log.w(TAG, "Failed notification suppressed: ${ne.message}")
+            }
         }
     }
 

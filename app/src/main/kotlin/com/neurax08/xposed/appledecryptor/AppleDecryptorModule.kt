@@ -227,12 +227,20 @@ class AppleDecryptorModule : XposedModule() {
             moduleLog(Log.WARN, TAG, "Failed to init DownloadManager source=$source", error)
         }
 
-        runCatching {
-            val intent = Intent(appContext, DownloadNotificationService::class.java)
-            appContext.startForegroundService(intent)
-            moduleLog(Log.INFO, TAG, "DownloadNotificationService started source=$source")
-        }.onFailure { error ->
-            moduleLog(Log.WARN, TAG, "Failed to start notification service source=$source", error)
+        // Foreground service uses module resources / components — only safe in module process.
+        // In Apple Music host process, skip starting the service to avoid crashes.
+        // Track-info updates still work via DownloadNotificationService.updateTrackInfo statics.
+        val isHostProcess = appContext.packageName != "com.neurax08.xposed.appledecryptor"
+        if (isHostProcess) {
+            moduleLog(Log.INFO, TAG, "Skip DownloadNotificationService in host process source=$source")
+        } else {
+            runCatching {
+                val intent = Intent(appContext, DownloadNotificationService::class.java)
+                appContext.startForegroundService(intent)
+                moduleLog(Log.INFO, TAG, "DownloadNotificationService started source=$source")
+            }.onFailure { error ->
+                moduleLog(Log.WARN, TAG, "Failed to start notification service source=$source", error)
+            }
         }
     }
 
