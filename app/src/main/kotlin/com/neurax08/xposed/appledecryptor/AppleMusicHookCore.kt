@@ -50,19 +50,189 @@ object AppleMusicHookCore {
         return "${result.javaClass.name}, downloadUrl=$downloadUrl"
     }
 
-    fun extractDownloadUrl(result: Any?): String? {
-        if (result == null) {
+    /**
+         * Extract HLS / progressive download URL from Apple Music 5.2.1 MediaAssetInfo.
+         *
+         * From APK analysis (createHlsMediaAssetInfo / createMediaAssetInfo):
+         *   PlaybackAssetNative.getUrlString() → MediaAssetInfo.setDownloadUrl(url)
+         *   MediaAssetInfo.getDownloadUrl() returns private field downloadUrl
+         *
+         * Also accepts raw URL strings and one-level nested objects.
+         */
+        fun extractDownloadUrl(result: Any?): String? {
+            if (result == null) return null
+            if (result is String) return result.takeIf { looksLikeMediaUrl(it) }
+
+            // Primary path for 5.2.1: MediaAssetInfo.getDownloadUrl()
+            invokeNoArgString(result, "getDownloadUrl")
+                ?.takeIf { looksLikeMediaUrl(it) }
+                ?.let { return it }
+
+            // Field fallback (same class private downloadUrl)
+            readStringField(result, "downloadUrl")
+                ?.takeIf { looksLikeMediaUrl(it) }
+                ?.let { return it }
+
+            // Other getter names seen in forks / older builds
+            val methodNames = listOf(
+                "getHlsUrl",
+                "getUrl",
+                "getUrlString",
+                "getURI",
+                "getUri",
+                "getAssetUrl",
+                "getStreamUrl",
+                "getPlaybackUrl",
+            )
+            for (name in methodNames) {
+                val v = invokeNoArgString(result, name)
+                if (v != null && looksLikeMediaUrl(v)) return v
+            }
+
+            // Any string field that looks like a media URL
+            val fromAnyField = result.javaClass.declaredFields.firstNotNullOfOrNull { field ->
+                runCatching {
+                    field.isAccessible = true
+                    (field.get(result) as? String)?.takeIf { looksLikeMediaUrl(it) }
+                }.getOrNull()
+            }
+            if (fromAnyField != null) return fromAnyField
+
             return null
         }
 
-        val value = runCatching {
-            result.javaClass.getDeclaredMethod("getDownloadUrl").apply {
-                isAccessible = true
-            }.invoke(result)
-        }.getOrNull()
+        /** Extra MediaAssetInfo fields useful for logging / key prep. */
+        fun extractMediaAssetMeta(result: Any?): MediaAssetMeta? {
+            if (result == null) return null
+            val clsName = result.javaClass.name
+            if (!clsName.contains("MediaAssetInfo")) {
+                // still try getters — requestAsset returns MediaAssetInfo
+            }
+            return MediaAssetMeta(
+                downloadUrl = extractDownloadUrl(result),
+                adamId = invokeNoArgLong(result, "getAdamId")
+                    ?: readLongField(result, "adamId"),
+                storeId = invokeNoArgLong(result, "getStoreId")
+                    ?: readLongField(result, "storeId"),
+                flavor = invokeNoArgString(result, "getFlavor")
+                    ?: readStringField(result, "flavor"),
+                keyServerUrl = invokeNoArgString(result, "getKeyServerUrl")
+                    ?: readStringField(result, "keyServerUrl"),
+                keyCertUrl = invokeNoArgString(result, "getKeyCertUrl")
+                    ?: readStringField(result, "keyCertUrl"),
+                keyServerProtocolType = invokeNoArgString(result, "getKeyServerProtocolType")
+                    ?: readStringField(result, "keyServerProtocolType"),
+                typeName = runCatching {
+                    invokeNoArgAny(result, "getType")?.toString()
+                }.getOrNull(),
+                endpointType = invokeNoArgInt(result, "getEndpointType"),
+                className = clsName,
+            )
+        }
 
-        return (value as? String)?.takeIf { it.isNotBlank() }
-    }
+        data class MediaAssetMeta(
+            val downloadUrl: String?,
+            val adamId: Long?,
+            val storeId: Long?,
+            val flavor: String?,
+            val keyServerUrl: String?,
+            val keyCertUrl: String?,
+            val keyServerProtocolType: String?,
+            val typeName: String?,
+            val endpointType: Int?,
+            val className: String,
+        ) {
+            fun describe(): String {
+                val url = downloadUrl?.let { summarizeUri(it) } ?: "<null>"
+                return "cls=$className adamId=$adamId storeId=$storeId flavor=$flavor " +
+                    "type=$typeName endpoint=$endpointType url=$url keyServer=${keyServerUrl?.take(40)}"
+            }
+        }
+
+        private fun invokeNoArgString(target: Any, methodName: String): String? {
+            return runCatching {
+                val m = target.javaClass.methods.firstOrNull {
+                    it.name == methodName && it.parameterCount == 0
+                } ?: target.javaClass.declaredMethods.firstOrNull {
+                    it.name == methodName && it.parameterCount == 0
+                }
+                m?.isAccessible = true
+                m?.invoke(target) as? String
+            }.getOrNull()?.takeIf { it.isNotBlank() }
+        }
+
+        private fun invokeNoArgAny(target: Any, methodName: String): Any? {
+            return runCatching {
+                val m = target.javaClass.methods.firstOrNull {
+                    it.name == methodName && it.parameterCount == 0
+                } ?: return@runCatching null
+                m.isAccessible = true
+                m.invoke(target)
+            }.getOrNull()
+        }
+
+        private fun invokeNoArgLong(target: Any, methodName: String): Long? {
+            return runCatching {
+                val m = target.javaClass.methods.firstOrNull {
+                    it.name == methodName && it.parameterCount == 0
+                } ?: return@runCatching null
+                m.isAccessible = true
+                when (val v = m.invoke(target)) {
+                    is Long -> v
+                    is Int -> v.toLong()
+                    is Number -> v.toLong()
+                    else -> null
+                }
+            }.getOrNull()
+        }
+
+        private fun invokeNoArgInt(target: Any, methodName: String): Int? {
+            return runCatching {
+                val m = target.javaClass.methods.firstOrNull {
+                    it.name == methodName && it.parameterCount == 0
+                } ?: return@runCatching null
+                m.isAccessible = true
+                when (val v = m.invoke(target)) {
+                    is Int -> v
+                    is Number -> v.toInt()
+                    else -> null
+                }
+            }.getOrNull()
+        }
+
+        private fun readStringField(target: Any, name: String): String? {
+            return runCatching {
+                val f = target.javaClass.getDeclaredField(name)
+                f.isAccessible = true
+                f.get(target) as? String
+            }.getOrNull()?.takeIf { it.isNotBlank() }
+        }
+
+        private fun readLongField(target: Any, name: String): Long? {
+            return runCatching {
+                val f = target.javaClass.getDeclaredField(name)
+                f.isAccessible = true
+                when (val v = f.get(target)) {
+                    is Long -> v
+                    is Int -> v.toLong()
+                    is Number -> v.toLong()
+                    else -> null
+                }
+            }.getOrNull()
+        }
+
+        fun looksLikeMediaUrl(value: String): Boolean {
+            val v = value.trim()
+            if (v.isEmpty()) return false
+            return v.startsWith("http://", ignoreCase = true) ||
+                v.startsWith("https://", ignoreCase = true) ||
+                v.startsWith("skd://", ignoreCase = true) ||
+                v.contains(".m3u8", ignoreCase = true) ||
+                v.contains("playlist", ignoreCase = true) ||
+                // Apple CDN progressive / HLS paths often look like this
+                v.contains("mzstatic.com", ignoreCase = true) ||
+                v.contains("apple.com", ignoreCase = true)
+        }
 
     fun decodeM3u8AdamId(payload: ByteArray): String? {
         return decodeLengthPrefixedString(payload)

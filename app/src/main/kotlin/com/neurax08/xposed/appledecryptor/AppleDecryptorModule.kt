@@ -108,6 +108,7 @@ class AppleDecryptorModule : XposedModule() {
     }
 
     private fun installAppleMusicHooks(classLoader: ClassLoader) {
+        // Primary: SVPlaybackLeaseManagerProxy.requestAsset (returns MediaAssetInfo)
         runCatching {
             val proxyClass = classLoader.loadClass(PLAYBACK_LEASE_PROXY_CLASS)
             val requestAsset = proxyClass.getDeclaredMethod(
@@ -123,71 +124,173 @@ class AppleDecryptorModule : XposedModule() {
                 requestAssetMethod.compareAndSet(null, requestAsset)
 
                 val args = chain.args.toTypedArray()
-                // requestAsset(long id, String adamId, String[] assetKinds, boolean force)
-                // Some builds pass adamId only as Long in args[0]; prefer String args[1].
-                val adamId = extractAdamId(args)
-                moduleLog(Log.INFO, TAG, "requestAsset before: ${AppleMusicHookCore.describeRequestAssetArgs(args)}")
+                // Apple Music 5.2.1 smali: p3 (String) is immediately overwritten by released flag read.
+                // Real song id is always the long p1/p2 (args[0]). Force HLS flavor list on args[2].
+                val adamIdFromArgs = extractAdamId(args)
+                moduleLog(Log.WARN, TAG, "requestAsset before: ${AppleMusicHookCore.describeRequestAssetArgs(args)}")
                 if (args.size >= 3) {
                     args[2] = AppleMusicHookCore.hlsAssetKinds()
                 }
-                moduleLog(Log.INFO, TAG, "requestAsset after: ${AppleMusicHookCore.describeRequestAssetArgs(args)}")
+                moduleLog(Log.WARN, TAG, "requestAsset after: ${AppleMusicHookCore.describeRequestAssetArgs(args)}")
 
                 val result = chain.proceed(args)
-                moduleLog(Log.INFO, TAG, "requestAsset result: ${AppleMusicHookCore.describeRequestAssetResult(result)}")
-                val hlsUrl = AppleMusicHookCore.extractDownloadUrl(result)
+                val meta = AppleMusicHookCore.extractMediaAssetMeta(result)
+                moduleLog(
+                    Log.WARN,
+                    TAG,
+                    "requestAsset result: ${meta?.describe() ?: AppleMusicHookCore.describeRequestAssetResult(result)}",
+                )
 
-                // AutoTracker: record adamId + HLS URL for internal download pipeline
-                if (adamId != null && hlsUrl != null) {
-                    moduleLog(Log.INFO, TAG, "AutoTracker adamId=$adamId url=$hlsUrl")
-                    lastSeenAdamId = adamId
-                    lastSeenHlsUrl = hlsUrl
-                    DownloadNotificationService.updateTrackInfo(adamId, "Track $adamId", "")
+                // Prefer adamId from MediaAssetInfo.getAdamId(); fall back to long arg.
+                val adamId = meta?.adamId?.takeIf { it != 0L }?.toString()
+                    ?: adamIdFromArgs
+                val hlsUrl = meta?.downloadUrl
+                    ?: AppleMusicHookCore.extractDownloadUrl(result)
+                    ?: lastSeenHlsUrl?.takeIf { lastSeenAdamId == adamId }
 
-                    // Resolve context: use cached ref, then ActivityThread, then this module.
-                    val liveCtx = resolveAppContext()
-                    if (liveCtx != null && !SharedQueueStore.isInitialized()) {
-                        bindDownloadStack(liveCtx, "requestAsset")
-                    }
-
-                    // Always write shared queue immediately (sync, no coroutine dependency).
-                    runCatching {
-                        SharedQueueStore.ensureInit(liveCtx)
-                        SharedQueueStore.upsertSync(
-                            SharedQueueStore.QueueEntry(
-                                adamId = adamId,
-                                title = "Track $adamId",
-                                status = "QUEUED",
-                                hlsUrl = hlsUrl,
-                            ),
-                            seedContext = liveCtx,
-                        )
-                        moduleLog(
-                            Log.INFO,
-                            TAG,
-                            "SharedQueue wrote adamId=$adamId path=${SharedQueueStore.getActivePath()} err=${SharedQueueStore.lastError} init=${SharedQueueStore.isInitialized()}",
-                        )
-                    }.onFailure { error ->
-                        moduleLog(Log.WARN, TAG, "SharedQueue write failed", error)
-                    }
-
-                    // Feed URL into download manager. Auto-start gated by settings.
-                    runCatching {
-                        if (liveCtx != null) {
-                            DownloadManager.init(liveCtx, asExecutor = true)
-                        }
-                        DownloadManager.provideHlsUrl(
-                            adamId = adamId,
-                            hlsUrl = hlsUrl,
-                            autoEnqueue = DownloadSettings.isAutoDownloadEnabled(),
-                        )
-                    }
-                }
+                handleAssetCaptured(
+                    adamId = adamId,
+                    hlsUrl = hlsUrl,
+                    flavor = meta?.flavor,
+                    keyServerUrl = meta?.keyServerUrl,
+                    source = "requestAsset",
+                )
 
                 result
             }
-            moduleLog(Log.INFO, TAG, "Hooked $PLAYBACK_LEASE_PROXY_CLASS.$REQUEST_ASSET_METHOD")
+            moduleLog(Log.WARN, TAG, "Hooked $PLAYBACK_LEASE_PROXY_CLASS.$REQUEST_ASSET_METHOD")
         }.onFailure { error ->
             moduleLog(Log.WARN, TAG, "Failed to hook Apple Music lease request", error)
+        }
+
+        // Backup: MediaAssetInfo.setDownloadUrl(String) — filled by createHlsMediaAssetInfo
+        // from PlaybackAssetNative.getUrlString(). Captures URL even if requestAsset hook misses meta.
+        runCatching {
+            val mediaAssetClass = classLoader.loadClass(
+                "com.apple.android.music.playback.model.MediaAssetInfo",
+            )
+            val setDownloadUrl = mediaAssetClass.getDeclaredMethod(
+                "setDownloadUrl",
+                String::class.java,
+            )
+            hook(setDownloadUrl).intercept { chain ->
+                val url = chain.args.getOrNull(0) as? String
+                val host = chain.thisObject
+                val adamFromObj = runCatching {
+                    val m = host.javaClass.getMethod("getAdamId")
+                    (m.invoke(host) as? Long)?.takeIf { it != 0L }?.toString()
+                }.getOrNull()
+                val flavor = runCatching {
+                    host.javaClass.getMethod("getFlavor").invoke(host) as? String
+                }.getOrNull()
+
+                if (!url.isNullOrBlank() && AppleMusicHookCore.looksLikeMediaUrl(url)) {
+                    moduleLog(
+                        Log.WARN,
+                        TAG,
+                        "setDownloadUrl capture adamId=${adamFromObj ?: lastSeenAdamId} flavor=$flavor url=${AppleMusicHookCore.summarizeUri(url)}",
+                    )
+                    handleAssetCaptured(
+                        adamId = adamFromObj ?: lastSeenAdamId,
+                        hlsUrl = url,
+                        flavor = flavor,
+                        keyServerUrl = runCatching {
+                            host.javaClass.getMethod("getKeyServerUrl").invoke(host) as? String
+                        }.getOrNull(),
+                        source = "setDownloadUrl",
+                    )
+                }
+                chain.proceed(chain.args.toTypedArray())
+            }
+            moduleLog(Log.WARN, TAG, "Hooked MediaAssetInfo.setDownloadUrl")
+        }.onFailure { error ->
+            moduleLog(Log.WARN, TAG, "Failed to hook MediaAssetInfo.setDownloadUrl", error)
+        }
+    }
+
+    /**
+     * Common path: write shared queue + optionally start download.
+     * Safe to call from requestAsset and setDownloadUrl hooks.
+     */
+    private fun handleAssetCaptured(
+        adamId: String?,
+        hlsUrl: String?,
+        flavor: String?,
+        keyServerUrl: String?,
+        source: String,
+    ) {
+        if (adamId.isNullOrBlank() || adamId == "0") {
+            moduleLog(
+                Log.WARN,
+                TAG,
+                "AutoTracker skip source=$source adamId=${adamId ?: "<null>"} hls=${hlsUrl?.let(AppleMusicHookCore::summarizeUri) ?: "<null>"}",
+            )
+            return
+        }
+
+        lastSeenAdamId = adamId
+        if (!hlsUrl.isNullOrBlank()) {
+            lastSeenHlsUrl = hlsUrl
+        }
+        DownloadNotificationService.updateTrackInfo(adamId, "Track $adamId", flavor.orEmpty())
+
+        val liveCtx = resolveAppContext()
+        if (liveCtx != null && !SharedQueueStore.isInitialized()) {
+            bindDownloadStack(liveCtx, source)
+        }
+
+        val titleLabel = buildString {
+            append("Track $adamId")
+            if (!flavor.isNullOrBlank()) append(" [$flavor]")
+            if (hlsUrl.isNullOrBlank()) append(" (waiting HLS)")
+        }
+
+        moduleLog(
+            Log.WARN,
+            TAG,
+            "AutoTracker source=$source adamId=$adamId flavor=$flavor " +
+                "hls=${hlsUrl?.let(AppleMusicHookCore::summarizeUri) ?: "<null>"} " +
+                "keyServer=${keyServerUrl?.take(48) ?: "<null>"} " +
+                "autoDl=${DownloadSettings.isAutoDownloadEnabled()}",
+        )
+
+        runCatching {
+            SharedQueueStore.ensureInit(liveCtx)
+            SharedQueueStore.upsertSync(
+                SharedQueueStore.QueueEntry(
+                    adamId = adamId,
+                    title = titleLabel,
+                    status = "QUEUED",
+                    hlsUrl = hlsUrl.orEmpty(),
+                ),
+                seedContext = liveCtx,
+            )
+            moduleLog(
+                Log.WARN,
+                TAG,
+                "SharedQueue wrote adamId=$adamId path=${SharedQueueStore.getActivePath()} " +
+                    "err=${SharedQueueStore.lastError} init=${SharedQueueStore.isInitialized()} source=$source",
+            )
+        }.onFailure { error ->
+            moduleLog(Log.WARN, TAG, "SharedQueue write failed source=$source", error)
+        }
+
+        if (liveCtx != null) {
+            runCatching { DownloadManager.init(liveCtx, asExecutor = true) }
+        }
+
+        if (!hlsUrl.isNullOrBlank()) {
+            runCatching {
+                DownloadManager.provideHlsUrl(
+                    adamId = adamId,
+                    hlsUrl = hlsUrl,
+                    autoEnqueue = DownloadSettings.isAutoDownloadEnabled(),
+                )
+            }
+        } else {
+            runCatching {
+                DownloadManager.enqueue(adamId = adamId, title = titleLabel, hlsUrl = "")
+            }
         }
     }
 
@@ -195,16 +298,26 @@ class AppleDecryptorModule : XposedModule() {
 
     fun getLastSeenHlsUrl(): String? = lastSeenHlsUrl
 
+    /**
+     * Apple Music 5.2.1 requestAsset(long id, String ignored, String[] kinds, boolean force):
+     * the String parameter is discarded immediately in smali — real id is the long.
+     * Still accept non-blank String for older builds.
+     */
     private fun extractAdamId(args: Array<Any?>): String? {
+        val asLong = when (val v = args.getOrNull(0)) {
+            is Long -> v
+            is Int -> v.toLong()
+            is Number -> v.toLong()
+            else -> null
+        }
+        if (asLong != null && asLong != 0L) {
+            return asLong.toString()
+        }
         val asString = args.getOrNull(1) as? String
         if (!asString.isNullOrBlank() && asString != "0") {
             return asString
         }
-        val asLong = args.getOrNull(0) as? Long
-        if (asLong != null && asLong != 0L) {
-            return asLong.toString()
-        }
-        return asString?.takeIf { it.isNotBlank() }
+        return null
     }
 
     private fun bindDownloadStack(appContext: android.content.Context, source: String) {
