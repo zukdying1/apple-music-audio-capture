@@ -14,8 +14,9 @@ import java.nio.ByteOrder
  * Writes decrypted audio samples.
  *
  * Preferred path: ALAC frames into MPEG-4 via MediaMuxer.
- * WAV fallback is ONLY used for raw PCM (mime audio/raw). Compressed ALAC frames
- * are never written as WAV (that would produce a broken file).
+ * Fallback path: manual ISOBMFF ALAC writer ([IsoBmffAlacWriter]) when MediaMuxer
+ * rejects audio/alac (common on OEM ROMs even with API 30+).
+ * WAV fallback is ONLY used for raw PCM.
  */
 class M4aWriter {
     companion object {
@@ -26,7 +27,8 @@ class M4aWriter {
     }
 
     enum class OutputMode {
-        ALAC_M4A,
+        ALAC_M4A_MUXER,
+        ALAC_M4A_MANUAL,
         PCM_WAV,
         NONE,
     }
@@ -42,6 +44,8 @@ class M4aWriter {
     private var wavChannels: Int = 2
     private var nextPresentationTimeUs: Long = 0L
     private var initError: String? = null
+    private var manualWriter: IsoBmffAlacWriter? = null
+    private var effectiveTrackInfo: TrackInfo? = null
 
     fun init(title: String, trackInfo: TrackInfo): Boolean {
         reset()
@@ -61,39 +65,42 @@ class M4aWriter {
         val isPcm = mime.equals(PCM_MIME, ignoreCase = true) ||
             mime.equals("audio/pcm", ignoreCase = true)
 
-        // Prefer ALAC M4A when not raw PCM.
+        // Ensure ALAC has a usable magic cookie for muxers / players.
+        val normalized = normalizeTrackInfo(trackInfo)
+        effectiveTrackInfo = normalized
+
         if (!isPcm) {
-            try {
-                val format = createAlacMediaFormat(trackInfo)
-                if (format != null) {
-                    muxer = MediaMuxer(m4aPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                    trackIndex = muxer!!.addTrack(format)
-                    muxer!!.start()
-                    isStarted = true
-                    outputMode = OutputMode.ALAC_M4A
-                    outputPath = m4aPath
-                    Log.i(TAG, "M4A writer initialized: $m4aPath track=$trackIndex")
-                    return true
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "ALAC M4A init failed: ${e.message}", e)
-                runCatching { muxer?.stop() }
-                muxer?.release()
-                muxer = null
-                initError = "MediaMuxer ALAC failed: ${e.message}"
+            // 1) Try MediaMuxer
+            val muxerOk = tryInitMediaMuxer(m4aPath, normalized)
+            if (muxerOk) return true
+
+            // 2) Manual ISOBMFF fallback (always works if we can write the file)
+            val manual = IsoBmffAlacWriter()
+            if (manual.init(m4aPath, normalized)) {
+                manualWriter = manual
+                isStarted = true
+                outputMode = OutputMode.ALAC_M4A_MANUAL
+                outputPath = m4aPath
+                initError = null
+                Log.i(TAG, "M4A manual ISOBMFF writer initialized: $m4aPath")
+                return true
             }
-            // Do NOT fall back to WAV for compressed ALAC — fail cleanly.
+
+            initError = listOfNotNull(
+                initError,
+                manual.getError(),
+            ).joinToString(" | ").ifBlank { "ALAC M4A writers unavailable" }
             isStarted = false
             outputMode = OutputMode.NONE
-            Log.e(TAG, "Refusing WAV fallback for compressed ALAC (${trackInfo.mime})")
+            Log.e(TAG, "All ALAC M4A writers failed: $initError")
             return false
         }
 
         // PCM-only WAV path
         return try {
             wavOutputStream = FileOutputStream(wavPath)
-            wavSampleRate = trackInfo.sampleRate.coerceAtLeast(1)
-            wavChannels = trackInfo.channelCount.coerceAtLeast(1)
+            wavSampleRate = normalized.sampleRate.coerceAtLeast(1)
+            wavChannels = normalized.channelCount.coerceAtLeast(1)
             wavOutputStream?.write(ByteArray(44))
             wavDataSize = 0
             isStarted = true
@@ -111,7 +118,8 @@ class M4aWriter {
     fun writeSample(sample: AudioSample) {
         if (!isStarted) return
         when (outputMode) {
-            OutputMode.ALAC_M4A -> writeM4aSample(sample)
+            OutputMode.ALAC_M4A_MUXER -> writeM4aSample(sample)
+            OutputMode.ALAC_M4A_MANUAL -> manualWriter?.writeSample(sample)
             OutputMode.PCM_WAV -> writeWavSample(sample)
             OutputMode.NONE -> Unit
         }
@@ -120,12 +128,17 @@ class M4aWriter {
     fun finish(): String? {
         if (!isStarted) return null
         return try {
-            when (outputMode) {
-                OutputMode.ALAC_M4A -> finishM4a()
+            val path = when (outputMode) {
+                OutputMode.ALAC_M4A_MUXER -> finishM4a()
+                OutputMode.ALAC_M4A_MANUAL -> {
+                    val p = manualWriter?.finish()
+                    isStarted = false
+                    p ?: outputPath
+                }
                 OutputMode.PCM_WAV -> finishWav()
-                OutputMode.NONE -> return null
+                OutputMode.NONE -> null
             }
-            outputPath
+            path?.takeIf { it.isNotBlank() && File(it).exists() && File(it).length() > 0 }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to finalize output file", e)
             null
@@ -137,6 +150,58 @@ class M4aWriter {
     fun getInitError(): String? = initError
     fun isFallbackWav(): Boolean = outputMode == OutputMode.PCM_WAV
 
+    private fun normalizeTrackInfo(trackInfo: TrackInfo): TrackInfo {
+        val rate = trackInfo.sampleRate.takeIf { it > 0 } ?: 44100
+        val ch = trackInfo.channelCount.takeIf { it > 0 } ?: 2
+        val cookie = when {
+            trackInfo.csd0 != null && trackInfo.csd0!!.size >= 24 -> trackInfo.csd0
+            else -> {
+                Log.w(TAG, "ALAC csd-0 missing/short (len=${trackInfo.csd0?.size ?: 0}); using default cookie rate=$rate ch=$ch")
+                IsoBmffAlacWriter.buildDefaultAlacCookie(rate, ch)
+            }
+        }
+        return trackInfo.copy(
+            mime = trackInfo.mime.ifBlank { ALAC_MIME },
+            sampleRate = rate,
+            channelCount = ch,
+            csd0 = cookie,
+        )
+    }
+
+    private fun tryInitMediaMuxer(m4aPath: String, trackInfo: TrackInfo): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            Log.w(TAG, "MediaMuxer ALAC requires API 30+, device has ${Build.VERSION.SDK_INT}")
+            initError = "API ${Build.VERSION.SDK_INT} < 30 for MediaMuxer ALAC"
+            return false
+        }
+        return try {
+            val format = createAlacMediaFormat(trackInfo)
+            val m = MediaMuxer(m4aPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val idx = m.addTrack(format)
+            m.start()
+            muxer = m
+            trackIndex = idx
+            isStarted = true
+            outputMode = OutputMode.ALAC_M4A_MUXER
+            outputPath = m4aPath
+            initError = null
+            Log.i(TAG, "M4A MediaMuxer initialized: $m4aPath track=$idx csd0=${trackInfo.csd0?.size}")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaMuxer ALAC init failed: ${e.message}", e)
+            runCatching { muxer?.stop() }
+            muxer?.release()
+            muxer = null
+            trackIndex = -1
+            isStarted = false
+            outputMode = OutputMode.NONE
+            initError = "MediaMuxer ALAC failed: ${e.message}"
+            // delete partial file
+            runCatching { File(m4aPath).delete() }
+            false
+        }
+    }
+
     private fun reset() {
         runCatching {
             if (isStarted && muxer != null) {
@@ -145,6 +210,8 @@ class M4aWriter {
         }
         muxer?.release()
         muxer = null
+        runCatching { manualWriter?.finish() }
+        manualWriter = null
         runCatching { wavOutputStream?.close() }
         wavOutputStream = null
         isStarted = false
@@ -154,28 +221,22 @@ class M4aWriter {
         nextPresentationTimeUs = 0L
         outputPath = ""
         initError = null
+        effectiveTrackInfo = null
     }
 
-    private fun createAlacMediaFormat(trackInfo: TrackInfo): MediaFormat? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            Log.w(TAG, "ALAC M4A requires API 30+, device has ${Build.VERSION.SDK_INT}")
-            initError = "API ${Build.VERSION.SDK_INT} < 30 for MediaMuxer ALAC"
-            return null
-        }
-
+    private fun createAlacMediaFormat(trackInfo: TrackInfo): MediaFormat {
         val sampleRate = trackInfo.sampleRate.coerceAtLeast(1)
         val channelCount = trackInfo.channelCount.coerceAtLeast(1)
         val format = MediaFormat.createAudioFormat(ALAC_MIME, sampleRate, channelCount)
         format.setInteger(MediaFormat.KEY_BIT_RATE, trackInfo.bitrate.takeIf { it > 0 } ?: 256000)
 
-        if (trackInfo.csd0 != null && trackInfo.csd0.isNotEmpty()) {
-            format.setByteBuffer("csd-0", ByteBuffer.wrap(trackInfo.csd0))
-        } else {
-            // Many devices reject ALAC tracks without magic cookie.
-            Log.w(TAG, "ALAC csd-0 (magic cookie) missing; MediaMuxer may reject track")
+        val csd = trackInfo.csd0
+        if (csd != null && csd.isNotEmpty()) {
+            format.setByteBuffer("csd-0", ByteBuffer.wrap(csd))
         }
 
-        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, sampleRate * channelCount * 4)
+        // Some devices want max input size
+        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, (sampleRate * channelCount).coerceAtLeast(4096) * 4)
         return format
     }
 
@@ -204,7 +265,7 @@ class M4aWriter {
         }
     }
 
-    private fun finishM4a() {
+    private fun finishM4a(): String? {
         muxer?.let {
             try {
                 it.stop()
@@ -215,6 +276,7 @@ class M4aWriter {
         }
         muxer = null
         isStarted = false
+        return outputPath
     }
 
     private fun writeWavSample(sample: AudioSample) {
@@ -229,7 +291,7 @@ class M4aWriter {
         }
     }
 
-    private fun finishWav() {
+    private fun finishWav(): String? {
         wavOutputStream?.let { stream ->
             try {
                 stream.channel.position(0)
@@ -241,6 +303,7 @@ class M4aWriter {
         }
         wavOutputStream = null
         isStarted = false
+        return outputPath
     }
 
     private fun createWavHeader(dataSize: Int, sampleRate: Int, channels: Int): ByteArray {

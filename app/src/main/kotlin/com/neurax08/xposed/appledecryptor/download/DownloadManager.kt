@@ -284,13 +284,35 @@ object DownloadManager {
                 throw Exception("No segments found in HLS playlist")
             }
             dao?.update(item.copy(totalSegments = segments.size))
-            Log.i(TAG, "Found ${segments.size} segments for adamId=$adamId")
+            Log.i(TAG, "Found ${segments.size} segments for adamId=$adamId map=${playlist.mapUri}")
 
             val keyUri = playlist.keyUri?.takeIf { it.isNotBlank() } ?: m3u8Url
             if (!AppleMusicNativeBridge.prepareSession(adamId, keyUri)) {
                 throw Exception(
                     "Failed to prepare decrypt session adamId=$adamId status=${AppleMusicNativeBridge.resolverStatus()}",
                 )
+            }
+
+            // Download fMP4 init segment (#EXT-X-MAP) for ALAC magic cookie / sample rate.
+            // Media fragments rarely contain moov; without cookie MediaMuxer often rejects the track.
+            var initTrackInfo: TrackInfo? = null
+            val mapUri = playlist.mapUri
+            if (!mapUri.isNullOrBlank()) {
+                runCatching {
+                    val initBytes = hlsDownloader.downloadSegment(mapUri)
+                    Log.i(TAG, "init segment downloaded bytes=${initBytes.size} uri=$mapUri")
+                    initTrackInfo = alacExtractor.extractSamplesFromFmp4(initBytes).trackInfo
+                        ?: parseTrackInfoFromInitSegment(initBytes)
+                    Log.i(
+                        TAG,
+                        "init trackInfo mime=${initTrackInfo?.mime} rate=${initTrackInfo?.sampleRate} " +
+                            "ch=${initTrackInfo?.channelCount} csd0=${initTrackInfo?.csd0?.size}",
+                    )
+                }.onFailure { e ->
+                    Log.w(TAG, "init segment parse failed: ${e.message}")
+                }
+            } else {
+                Log.w(TAG, "No #EXT-X-MAP in playlist; ALAC cookie will use defaults if needed")
             }
 
             val preferSampleLevel = DownloadSettings.isPreferSampleLevelDecrypt()
@@ -322,15 +344,14 @@ object DownloadManager {
                         )
 
                         if (!writerReady) {
-                            val trackInfo = produced.trackInfo ?: TrackInfo(
-                                mime = "audio/alac",
-                                sampleRate = 44100,
-                                channelCount = 2,
-                                csd0 = null,
-                                durationUs = 0L,
+                            val trackInfo = mergeTrackInfo(initTrackInfo, produced.trackInfo)
+                            Log.i(
+                                TAG,
+                                "writer trackInfo mime=${trackInfo.mime} rate=${trackInfo.sampleRate} " +
+                                    "ch=${trackInfo.channelCount} csd0=${trackInfo.csd0?.size}",
                             )
                             if (!m4aWriter.init(title, trackInfo)) {
-                                val reason = m4aWriter.getInitError() ?: "MediaMuxer ALAC unavailable"
+                                val reason = m4aWriter.getInitError() ?: "ALAC M4A writers unavailable"
                                 throw Exception(
                                     "Failed to create M4A (ALAC). WAV fallback disabled for compressed audio. $reason",
                                 )
@@ -440,6 +461,102 @@ object DownloadManager {
                 Log.w(TAG, "Failed notification suppressed: ${ne.message}")
             }
         }
+    }
+
+    /**
+     * Prefer init-segment TrackInfo (has ALAC cookie); fill gaps from media segment.
+     */
+    private fun mergeTrackInfo(init: TrackInfo?, media: TrackInfo?): TrackInfo {
+        val base = init ?: media
+        if (base == null) {
+            return TrackInfo(
+                mime = "audio/alac",
+                sampleRate = 44100,
+                channelCount = 2,
+                csd0 = IsoBmffAlacWriter.buildDefaultAlacCookie(44100, 2),
+                durationUs = 0L,
+            )
+        }
+        val rate = when {
+            base.sampleRate > 0 -> base.sampleRate
+            media != null && media.sampleRate > 0 -> media.sampleRate
+            else -> 44100
+        }
+        val ch = when {
+            base.channelCount > 0 -> base.channelCount
+            media != null && media.channelCount > 0 -> media.channelCount
+            else -> 2
+        }
+        val cookie = when {
+            base.csd0 != null && base.csd0!!.isNotEmpty() -> base.csd0
+            media?.csd0 != null && media.csd0!!.isNotEmpty() -> media.csd0
+            else -> IsoBmffAlacWriter.buildDefaultAlacCookie(rate, ch)
+        }
+        return TrackInfo(
+            mime = base.mime.ifBlank { media?.mime ?: "audio/alac" }.ifBlank { "audio/alac" },
+            sampleRate = rate,
+            channelCount = ch,
+            csd0 = cookie,
+            durationUs = base.durationUs.takeIf { it > 0 } ?: media?.durationUs ?: 0L,
+            bitrate = base.bitrate.takeIf { it > 0 } ?: media?.bitrate ?: 0,
+        )
+    }
+
+    /** Parse moov/stsd from raw init fMP4 bytes when MediaExtractor has no samples. */
+    private fun parseTrackInfoFromInitSegment(initBytes: ByteArray): TrackInfo? {
+        // AlacFrameExtractor's extractFromFileFormat walks moov boxes.
+        val result = alacExtractor.extractSamplesFromFmp4(initBytes)
+        if (result.trackInfo != null) return result.trackInfo
+        // Fallback: scan for 'alac' fourcc and surrounding AudioSampleEntry fields.
+        return scanAlacFromBytes(initBytes)
+    }
+
+    private fun scanAlacFromBytes(data: ByteArray): TrackInfo? {
+        // Find "alac" fourcc that is likely a SampleEntry or config atom.
+        val needle = byteArrayOf('a'.code.toByte(), 'l'.code.toByte(), 'a'.code.toByte(), 'c'.code.toByte())
+        var i = 0
+        var sampleRate = 44100
+        var channels = 2
+        var cookie: ByteArray? = null
+        while (i + 8 < data.size) {
+            if (data[i] == needle[0] && data[i + 1] == needle[1] &&
+                data[i + 2] == needle[2] && data[i + 3] == needle[3]
+            ) {
+                // Possible AudioSampleEntry: size is 4 bytes before type at i-4
+                // channels@+24, sampleRate 16.16@+32; nested cookie often after +36
+                val entryStart = i - 4
+                if (entryStart >= 0 && entryStart + 36 <= data.size) {
+                    val ch = AlacFrameExtractor.readUint16(data, entryStart + 24)
+                    val rateFixed = AlacFrameExtractor.readUint32(data, entryStart + 32)
+                    if (ch in 1..8) channels = ch
+                    val rate = (rateFixed shr 16).toInt()
+                    if (rate in 8000..384000) sampleRate = rate
+                }
+                // Nested 'alac' atom: size(4)+type(4)+payload — payload starts at i+4 when type is at i
+                // Prefer full 28-byte cookie (version/flags + ALACSpecificConfig)
+                if (i + 4 + 28 <= data.size) {
+                    cookie = data.copyOfRange(i + 4, i + 4 + 28)
+                }
+            }
+            i++
+        }
+        if (cookie == null && sampleRate == 44100 && channels == 2) {
+            // still return defaults so writer can proceed
+            return TrackInfo(
+                mime = "audio/alac",
+                sampleRate = sampleRate,
+                channelCount = channels,
+                csd0 = IsoBmffAlacWriter.buildDefaultAlacCookie(sampleRate, channels),
+                durationUs = 0L,
+            )
+        }
+        return TrackInfo(
+            mime = "audio/alac",
+            sampleRate = sampleRate,
+            channelCount = channels,
+            csd0 = cookie ?: IsoBmffAlacWriter.buildDefaultAlacCookie(sampleRate, channels),
+            durationUs = 0L,
+        )
     }
 
     private data class SegmentDecryptResult(

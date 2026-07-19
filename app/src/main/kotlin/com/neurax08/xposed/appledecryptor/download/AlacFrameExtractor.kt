@@ -369,17 +369,22 @@ class AlacFrameExtractor {
             if (offset + entrySize > data.size) break
             val format = String(data, offset + 4, 4, Charsets.ISO_8859_1)
 
-            // SampleEntry layout: size(4) + type(4) + reserved(6) + data_ref(2) + version/rev/vendor...
-            // For AudioSampleEntry: channelcount @ +16, samplerate @ +24 (16.16 fixed)
-            if (offset + 28 <= data.size) {
-                channelCount = readUint16(data, offset + 16).coerceAtLeast(1)
-                val sampleRateFixed = readUint32(data, offset + 24)
-                sampleRate = (sampleRateFixed shr 16).toInt().coerceAtLeast(1)
+            // AudioSampleEntry (ISO 14496-12) layout from entry start:
+            // size(4)+type(4)+reserved(6)+data_ref(2)+version(2)+rev(2)+vendor(4)
+            // +channelcount(2)@+24 +samplesize(2)@+26 +... +samplerate(4)@+32 (16.16 fixed)
+            // Nested codec config atoms start at +36.
+            if (offset + 36 <= data.size) {
+                channelCount = readUint16(data, offset + 24).coerceAtLeast(1).coerceAtMost(8)
+                val sampleRateFixed = readUint32(data, offset + 32)
+                val rate = (sampleRateFixed shr 16).toInt()
+                if (rate in 8000..384000) sampleRate = rate
             }
 
             if (format == "alac") {
                 mime = ALAC_MIME
-                csd0 = parseAlacMagicCookie(data, offset + 8, entrySize.toInt() - 8)
+                // Prefer nested 'alac' atom payload (magic cookie / csd-0).
+                csd0 = parseAlacMagicCookie(data, offset + 36, entrySize.toInt() - 36)
+                    ?: parseAlacMagicCookie(data, offset + 8, entrySize.toInt() - 8)
             }
 
             offset += entrySize.toInt()

@@ -19,6 +19,8 @@ data class HlsPlaylist(
     val keyUri: String?,
     val isMaster: Boolean,
     val variantUrl: String?,
+    /** fMP4 init segment URL from #EXT-X-MAP:URI="..." (holds moov / ALAC cookie). */
+    val mapUri: String? = null,
 )
 
 class HlsDownloader {
@@ -74,10 +76,19 @@ class HlsDownloader {
         var variantUrl: String? = null
         val segments = mutableListOf<HlsSegment>()
         var keyUri: String? = null
+        var mapUri: String? = null
         var currentDuration = 0f
         var sequenceNumber = 0
 
         val basePath = baseUrl.substringBeforeLast('/')
+
+        fun resolveUri(raw: String): String {
+            return if (raw.startsWith("http") || raw.startsWith("skd://")) {
+                raw
+            } else {
+                "$basePath/$raw"
+            }
+        }
 
         for (line in lines) {
             val trimmed = line.trim()
@@ -87,11 +98,7 @@ class HlsDownloader {
                     expectingVariant = true
                 }
                 expectingVariant && trimmed.isNotBlank() && !trimmed.startsWith("#") -> {
-                    variantUrl = if (trimmed.startsWith("http")) {
-                        trimmed
-                    } else {
-                        "$basePath/$trimmed"
-                    }
+                    variantUrl = resolveUri(trimmed)
                     expectingVariant = false
                 }
                 trimmed.startsWith("#EXTINF:") -> {
@@ -104,19 +111,22 @@ class HlsDownloader {
                 trimmed.startsWith("#EXT-X-KEY:") -> {
                     val uriMatch = Regex("URI=\"([^\"]+)\"").find(trimmed)
                     if (uriMatch != null) {
-                        val raw = uriMatch.groupValues[1]
-                        keyUri = if (raw.startsWith("http") || raw.startsWith("skd://")) {
-                            raw
-                        } else {
-                            "$basePath/$raw"
-                        }
+                        keyUri = resolveUri(uriMatch.groupValues[1])
+                    }
+                }
+                trimmed.startsWith("#EXT-X-MAP:") -> {
+                    // #EXT-X-MAP:URI="init.mp4"[,BYTERANGE="..."]
+                    val uriMatch = Regex("URI=\"([^\"]+)\"").find(trimmed)
+                    if (uriMatch != null) {
+                        mapUri = resolveUri(uriMatch.groupValues[1])
+                        Log.i(TAG, "M3U8 EXT-X-MAP uri=$mapUri")
                     }
                 }
                 trimmed.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> {
                     sequenceNumber = trimmed.removePrefix("#EXT-X-MEDIA-SEQUENCE:").trim().toIntOrNull() ?: 0
                 }
                 !isMaster && trimmed.isNotBlank() && !trimmed.startsWith("#") -> {
-                    val segmentUrl = if (trimmed.startsWith("http")) trimmed else "$basePath/$trimmed"
+                    val segmentUrl = resolveUri(trimmed)
                     segments.add(
                         HlsSegment(
                             url = segmentUrl,
@@ -138,6 +148,7 @@ class HlsDownloader {
             keyUri = keyUri,
             isMaster = isMaster || variantUrl != null,
             variantUrl = variantUrl,
+            mapUri = mapUri,
         )
     }
 }
