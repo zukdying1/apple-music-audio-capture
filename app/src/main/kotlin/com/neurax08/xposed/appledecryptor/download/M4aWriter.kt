@@ -153,17 +153,30 @@ class M4aWriter {
     private fun normalizeTrackInfo(trackInfo: TrackInfo): TrackInfo {
         val rate = trackInfo.sampleRate.takeIf { it > 0 } ?: 44100
         val ch = trackInfo.channelCount.takeIf { it > 0 } ?: 2
-        val cookie = when {
-            trackInfo.csd0 != null && trackInfo.csd0!!.size >= 24 -> trackInfo.csd0
-            else -> {
-                Log.w(TAG, "ALAC csd-0 missing/short (len=${trackInfo.csd0?.size ?: 0}); using default cookie rate=$rate ch=$ch")
-                IsoBmffAlacWriter.buildDefaultAlacCookie(rate, ch)
-            }
+        val raw = trackInfo.csd0
+        // Pure 24-byte ALACSpecificConfig for MediaCodec csd-0 (ExoPlayer AtomParsers)
+        val cookie = if (raw != null && raw.isNotEmpty()) {
+            IsoBmffAlacWriter.normalizeAlacCookie(raw, rate, ch)
+        } else {
+            Log.w(TAG, "ALAC csd-0 missing; using default cookie rate=$rate ch=$ch")
+            IsoBmffAlacWriter.buildDefaultAlacCookie(rate, ch)
         }
+        var finalRate = rate
+        var finalCh = ch
+        val cookieRate = IsoBmffAlacWriter.sampleRateFromCookie(cookie)
+        if (cookieRate in 8000..384000) finalRate = cookieRate
+        val cookieCh = IsoBmffAlacWriter.channelsFromCookie(cookie)
+        if (cookieCh in 1..8) finalCh = cookieCh
+        Log.i(
+            TAG,
+            "normalizeTrackInfo rate=$finalRate ch=$finalCh csd0=${cookie.size} " +
+                "frameLen=${IsoBmffAlacWriter.frameLengthFromCookie(cookie)} " +
+                "hex=${cookie.take(12).joinToString("") { "%02x".format(it) }}",
+        )
         return trackInfo.copy(
             mime = trackInfo.mime.ifBlank { ALAC_MIME },
-            sampleRate = rate,
-            channelCount = ch,
+            sampleRate = finalRate,
+            channelCount = finalCh,
             csd0 = cookie,
         )
     }

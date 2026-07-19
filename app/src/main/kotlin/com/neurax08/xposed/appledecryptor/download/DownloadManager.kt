@@ -590,6 +590,12 @@ object DownloadManager {
                         if (plain.isEmpty()) {
                             throw Exception("Empty decrypt result for sample index=$i")
                         }
+                        // FairPlay decrypt must yield bare ALAC packets, not fMP4 boxes.
+                        if (IsoBmffAlacWriter.looksLikeIsoBmff(plain)) {
+                            Log.w(TAG, "sample-level decrypt[$i] still looks like ISOBMFF size=${plain.size}")
+                            // Don't add container junk into muxer
+                            continue
+                        }
                         val duration = split.samples[i].durationUs.let { d ->
                             if (d > 0) d else {
                                 val total = (segmentDurationSec * 1_000_000f).toLong()
@@ -607,14 +613,18 @@ object DownloadManager {
                         )
                         pts += duration
                     }
-                    Log.i(TAG, "sample-level decrypt ok count=${audioSamples.size}")
-                    return SegmentDecryptResult(audioSamples, split.trackInfo)
+                    if (audioSamples.isNotEmpty()) {
+                        Log.i(TAG, "sample-level decrypt ok count=${audioSamples.size}")
+                        return SegmentDecryptResult(audioSamples, split.trackInfo)
+                    }
                 }
                 Log.w(TAG, "sample-level decrypt failed/mismatch; falling back to segment decrypt")
             }
         }
 
         // Fallback: decrypt whole segment then extract frames (legacy path).
+        // FairPlay often encrypts only mdat sample payloads; whole-segment decrypt may
+        // return a full fMP4 with plaintext mdat — never write that container as one ALAC sample.
         val decrypted = AppleMusicNativeBridge.decryptSample(encryptedSegment)
             ?: throw Exception("Segment decrypt returned null")
         if (decrypted.isEmpty()) {
@@ -624,7 +634,14 @@ object DownloadManager {
         val extracted = alacExtractor.extractSamplesFromFmp4(decrypted)
         if (extracted.success && extracted.samples.isNotEmpty()) {
             var pts = presentationCursorUs
-            val remapped = extracted.samples.map { sample ->
+            val remapped = extracted.samples.mapNotNull { sample ->
+                // Drop accidental ISOBMFF boxes
+                val head = ByteArray(minOf(8, sample.size))
+                sample.data.duplicate().apply { position(0) }.get(head)
+                if (IsoBmffAlacWriter.looksLikeIsoBmff(head) && sample.size > 16) {
+                    Log.w(TAG, "drop extracted sample that still looks like ISOBMFF size=${sample.size}")
+                    return@mapNotNull null
+                }
                 val duration = if (sample.durationUs > 0) {
                     sample.durationUs
                 } else {
@@ -640,10 +657,43 @@ object DownloadManager {
                 pts = out.presentationTimeUs + duration
                 out
             }
-            return SegmentDecryptResult(remapped, extracted.trackInfo)
+            if (remapped.isNotEmpty()) {
+                return SegmentDecryptResult(remapped, extracted.trackInfo)
+            }
         }
 
-        // Last resort: treat whole decrypted blob as one sample (ALAC frame or opaque).
+        // Last resort: only if decrypted payload is NOT an fMP4 container (bare ALAC frame).
+        if (IsoBmffAlacWriter.looksLikeIsoBmff(decrypted)) {
+            // Try splitting plaintext fMP4 via trun sizes (mdat is already decrypted in place).
+            val splitPlain = Fmp4SampleSplitter.split(decrypted, segmentDurationSec)
+            if (splitPlain.samples.isNotEmpty() &&
+                !IsoBmffAlacWriter.looksLikeIsoBmff(splitPlain.samples[0].data)
+            ) {
+                var pts = presentationCursorUs
+                val audioSamples = splitPlain.samples.map { s ->
+                    val duration = if (s.durationUs > 0) s.durationUs else {
+                        val total = (segmentDurationSec * 1_000_000f).toLong()
+                        if (splitPlain.samples.isNotEmpty()) total / splitPlain.samples.size else 0L
+                    }
+                    val out = AudioSample(
+                        data = ByteBuffer.wrap(s.data),
+                        size = s.data.size,
+                        presentationTimeUs = pts,
+                        durationUs = duration,
+                        isKeyFrame = s.isKeyFrame,
+                    )
+                    pts += duration
+                    out
+                }
+                Log.i(TAG, "plaintext fMP4 split ok count=${audioSamples.size}")
+                return SegmentDecryptResult(audioSamples, splitPlain.trackInfo ?: extracted.trackInfo)
+            }
+            throw Exception(
+                "Decrypted segment is still fMP4 container and frame extraction failed " +
+                    "(size=${decrypted.size}). Cannot mux as ALAC sample.",
+            )
+        }
+
         val durationUs = (segmentDurationSec * 1_000_000f).toLong()
         return SegmentDecryptResult(
             samples = listOf(

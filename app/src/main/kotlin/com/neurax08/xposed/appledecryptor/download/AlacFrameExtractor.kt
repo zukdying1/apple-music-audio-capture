@@ -406,6 +406,8 @@ class AlacFrameExtractor {
             val boxDataSize = (boxSize.toInt() - 8).coerceAtMost(end - boxDataOffset)
 
             if (boxType == "alac" && boxDataSize > 0) {
+                // Nested 'alac' atom payload is version/flags(4)+ALACSpecificConfig(24).
+                // ExoPlayer/MediaCodec csd-0 wants pure 24-byte config; callers normalize.
                 return data.copyOfRange(boxDataOffset, boxDataOffset + boxDataSize)
             }
             offset += boxSize.toInt()
