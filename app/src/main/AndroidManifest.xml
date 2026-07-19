@@ -21,6 +21,9 @@
         <intent>
             <action android:name="com.neurax08.xposed.appledecryptor.action.QUEUE_UPSERT" />
         </intent>
+        <intent>
+            <action android:name="com.neurax08.xposed.appledecryptor.action.FORCE_START" />
+        </intent>
         <provider android:authorities="com.neurax08.xposed.appledecryptor.queue" />
     </queries>
 

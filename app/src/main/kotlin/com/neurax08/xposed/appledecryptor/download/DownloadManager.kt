@@ -114,9 +114,9 @@ object DownloadManager {
             if (existing != null && (existing.status == "DOWNLOADING" || existing.status == "QUEUED")) {
                 if (hlsUrl.isNotBlank() && existing.hlsUrl.isBlank()) {
                     dao?.update(existing.copy(hlsUrl = hlsUrl, title = title.ifBlank { existing.title }))
-                    if (existing.status == "QUEUED") {
-                        startDownload(adamId)
-                    }
+                    // Do NOT auto-start here — Auto Download OFF must stay off.
+                    // Explicit starts go through forceStart / FORCE_START broadcast.
+                    Log.i(TAG, "Filled HLS on existing queue adamId=$adamId (no auto-start)")
                 }
                 Log.i(TAG, "Already queued/downloading adamId=$adamId status=${existing.status}")
                 return@launch
@@ -145,14 +145,12 @@ object DownloadManager {
                 )
             }
 
-            // Only the Apple Music process can actually decrypt/download.
-            // UI process just writes the shared queue; the executor poller picks it up.
-            if (item.hlsUrl.isNotBlank() && canExecuteDownloads()) {
-                startDownload(adamId)
-            } else if (item.hlsUrl.isBlank()) {
+            // Never auto-start from enqueue — Auto Download uses poller / provideHlsUrl(auto=true).
+            // Manual path: HostDownloadCommandReceiver → forceStart(adamId, hlsUrl).
+            if (item.hlsUrl.isBlank()) {
                 Log.i(TAG, "Queued without HLS URL adamId=$adamId; waiting for provideHlsUrl")
             } else {
-                Log.i(TAG, "Queued for executor process adamId=$adamId")
+                Log.i(TAG, "Queued adamId=$adamId executor=$executorMode (await forceStart or autoDl)")
             }
         }
     }
@@ -169,9 +167,10 @@ object DownloadManager {
     }
 
     /**
-     * Poller only auto-starts work when Auto Download is ON.
-     * Manual "Download" / Retry / enqueue with forceStart calls [startDownload] directly.
-     * This was the bug: poller previously started every QUEUED+URL item even when auto-download was off.
+     * Poller:
+     * - Auto Download ON → start every QUEUED + URL item.
+     * - Auto Download OFF → do nothing here; user must send FORCE_START / forceStart().
+     * Manual "Download now" is handled by HostDownloadCommandReceiver → forceStart().
      */
     private suspend fun pollQueuedWork() {
         if (!canExecuteDownloads()) return
@@ -830,29 +829,124 @@ object DownloadManager {
         }
     }
 
-    /** Explicit user-triggered start (Manual Add / Retry / Download button). */
-    fun forceStart(adamId: String) {
+    /**
+     * Explicit user-triggered start (Manual Add / Retry / Download button / FORCE_START broadcast).
+     * Must run in Apple Music executor process. UI process should use
+     * [HostDownloadCommandReceiver.sendForceStart] instead.
+     *
+     * @param hlsUrlOverride if non-blank, write/use this URL immediately (avoids race with provideHlsUrl)
+     * @param titleOverride optional title for new rows
+     */
+    fun forceStart(
+        adamId: String,
+        hlsUrlOverride: String = "",
+        titleOverride: String = "",
+    ) {
         if (!initialized || adamId.isBlank()) return
         scope.launch {
-            val item = dao?.getItem(adamId)
+            val overrideUrl = hlsUrlOverride.trim()
+            val overrideTitle = titleOverride.trim()
+            var item = dao?.getItem(adamId)
+
+            // Prefer override URL from FORCE_START broadcast extras (cross-process, no file race).
+            if (overrideUrl.isNotBlank()) {
+                if (item == null) {
+                    item = DownloadQueueItem(
+                        adamId = adamId,
+                        title = overrideTitle.ifBlank { "Track $adamId" },
+                        status = "QUEUED",
+                        hlsUrl = overrideUrl,
+                    )
+                    dao?.insert(item!!)
+                    Log.i(TAG, "forceStart: created item from override URL adamId=$adamId")
+                } else if (item!!.hlsUrl != overrideUrl || item!!.status == "FAILED" || item!!.status == "CANCELED") {
+                    item = item!!.copy(
+                        hlsUrl = overrideUrl,
+                        title = overrideTitle.ifBlank { item!!.title },
+                        status = "QUEUED",
+                        progress = 0,
+                        errorMessage = "",
+                    )
+                    dao?.update(item!!)
+                }
+            }
+
+            // Fallback: host-local Room only (Music process SharedQueue is NOT the UI file).
+            item = dao?.getItem(adamId)
+            if ((item == null || item!!.hlsUrl.isBlank())) {
+                val shared = runCatching {
+                    SharedQueueStore.loadSync().firstOrNull { it.adamId == adamId }
+                }.getOrNull()
+                if (shared != null && shared.hlsUrl.isNotBlank()) {
+                    if (item == null) {
+                        item = DownloadQueueItem(
+                            adamId = adamId,
+                            title = shared.title.ifBlank { "Track $adamId" },
+                            artist = shared.artist,
+                            status = "QUEUED",
+                            hlsUrl = shared.hlsUrl,
+                        )
+                        dao?.insert(item!!)
+                    } else {
+                        item = item!!.copy(hlsUrl = shared.hlsUrl)
+                        dao?.update(item!!)
+                    }
+                    Log.i(TAG, "forceStart: filled HLS from host local shared map adamId=$adamId")
+                }
+            }
+
+            item = dao?.getItem(adamId)
             if (item == null) {
                 Log.w(TAG, "forceStart: no local item adamId=$adamId")
                 return@launch
             }
             if (item.hlsUrl.isBlank()) {
                 Log.w(TAG, "forceStart: no HLS URL yet adamId=$adamId — play track once in Apple Music")
+                runCatching {
+                    SharedQueueStore.upsertSync(
+                        SharedQueueStore.QueueEntry(
+                            adamId = adamId,
+                            title = item.title,
+                            status = "FAILED",
+                            errorMessage = "No HLS URL — play this track in Apple Music first",
+                            hlsUrl = "",
+                        ),
+                    )
+                }
                 return@launch
             }
-            if (item.status == "COMPLETED") {
+            if (item.status == "COMPLETED" && overrideUrl.isBlank()) {
                 Log.i(TAG, "forceStart: already completed adamId=$adamId path=${item.filePath}")
                 return@launch
             }
-            dao?.update(item.copy(status = "QUEUED", progress = 0, errorMessage = ""))
+            dao?.update(
+                item.copy(
+                    status = "QUEUED",
+                    progress = 0,
+                    errorMessage = "",
+                    completedSegments = 0,
+                ),
+            )
+            runCatching {
+                SharedQueueStore.upsertSync(
+                    SharedQueueStore.QueueEntry(
+                        adamId = adamId,
+                        title = item.title,
+                        status = "QUEUED",
+                        progress = 0,
+                        hlsUrl = item.hlsUrl,
+                    ),
+                )
+            }
             if (canExecuteDownloads()) {
                 startDownload(adamId)
-                Log.i(TAG, "forceStart download adamId=$adamId")
+                Log.i(TAG, "forceStart download adamId=$adamId urlLen=${item.hlsUrl.length}")
             } else {
-                Log.w(TAG, "forceStart: executor not ready adamId=$adamId")
+                Log.w(
+                    TAG,
+                    "forceStart: executor not ready adamId=$adamId " +
+                        "executorMode=$executorMode native=${AppleMusicNativeBridge.isAvailable()}",
+                )
             }
         }
     }

@@ -357,6 +357,8 @@ class AppleDecryptorModule : XposedModule() {
         runCatching {
             // Executor mode: only this process has libandroidappmusic + native decrypt.
             DownloadManager.init(appContext, asExecutor = true)
+            // UI → host: "Download now" / Retry arrive as FORCE_START broadcasts.
+            com.neurax08.xposed.appledecryptor.download.HostDownloadCommandReceiver.register(appContext)
             moduleLog(Log.INFO, TAG, "DownloadManager initialized as executor source=$source")
         }.onFailure { error ->
             moduleLog(Log.WARN, TAG, "Failed to init DownloadManager source=$source", error)

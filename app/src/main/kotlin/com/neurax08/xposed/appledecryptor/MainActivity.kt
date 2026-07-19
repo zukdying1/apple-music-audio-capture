@@ -49,6 +49,7 @@ import androidx.lifecycle.viewModelScope
 import com.neurax08.xposed.appledecryptor.download.DownloadManager
 import com.neurax08.xposed.appledecryptor.download.DownloadQueueItem
 import com.neurax08.xposed.appledecryptor.download.DownloadSettings
+import com.neurax08.xposed.appledecryptor.download.HostDownloadCommandReceiver
 import com.neurax08.xposed.appledecryptor.download.M4aWriter
 import com.neurax08.xposed.appledecryptor.download.SharedQueueStore
 import com.neurax08.xposed.appledecryptor.ui.theme.ComposeEmptyActivityTheme
@@ -573,7 +574,8 @@ private fun SettingsSwitchRow(
     }
 }
 
-class DownloadViewModel : androidx.lifecycle.ViewModel() {
+class DownloadViewModel(application: android.app.Application) :
+    androidx.lifecycle.AndroidViewModel(application) {
     private val _queueItems = MutableStateFlow<List<SharedQueueStore.QueueEntry>>(emptyList())
     val queueItems: StateFlow<List<SharedQueueStore.QueueEntry>> = _queueItems
 
@@ -600,6 +602,13 @@ class DownloadViewModel : androidx.lifecycle.ViewModel() {
                 )
             )
             DownloadManager.enqueue(adamId = adamId, title = title, artist = artist)
+            // Manual add without URL yet — still notify host so poller / force can pick up after play.
+            HostDownloadCommandReceiver.sendForceStart(
+                context = getApplication(),
+                adamId = adamId,
+                hlsUrl = "",
+                title = title,
+            )
             refresh()
         }
     }
@@ -607,17 +616,26 @@ class DownloadViewModel : androidx.lifecycle.ViewModel() {
     fun retry(adamId: String) {
         viewModelScope.launch {
             val existing = SharedQueueStore.get(adamId)
-            SharedQueueStore.upsert(
-                (existing ?: SharedQueueStore.QueueEntry(adamId = adamId)).copy(
-                    status = "QUEUED",
-                    progress = 0,
-                    errorMessage = "",
-                    completedSegments = 0,
-                )
+            val entry = (existing ?: SharedQueueStore.QueueEntry(adamId = adamId)).copy(
+                status = "QUEUED",
+                progress = 0,
+                errorMessage = "",
+                completedSegments = 0,
             )
+            SharedQueueStore.upsert(entry)
+            // UI process cannot decrypt. Tell Apple Music process to start.
+            val ok = HostDownloadCommandReceiver.sendForceStart(
+                context = getApplication(),
+                adamId = adamId,
+                hlsUrl = entry.hlsUrl,
+                title = entry.title,
+            )
+            Log.i(
+                "AppleDecryptor",
+                "UI Download now / Retry adamId=$adamId forceBroadcast=$ok hlsBlank=${entry.hlsUrl.isBlank()}",
+            )
+            // Best-effort local path (no-op unless somehow in executor).
             DownloadManager.retry(adamId)
-            // Explicit user action — force start even if Auto Download is OFF
-            // (only works when Apple Music executor process is alive)
             DownloadManager.forceStart(adamId)
             refresh()
         }
