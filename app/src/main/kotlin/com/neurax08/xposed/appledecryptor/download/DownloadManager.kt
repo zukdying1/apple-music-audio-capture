@@ -66,7 +66,7 @@ object DownloadManager {
             return
         }
         applicationContext = context.applicationContext
-        DownloadSettings.ensureLoaded()
+        DownloadSettings.init(context.applicationContext)
         SharedQueueStore.init(context.applicationContext)
         try {
             database = DownloadDatabase.getInstance(context.applicationContext)
@@ -168,11 +168,20 @@ object DownloadManager {
         Log.i(TAG, "Queue poller started intervalMs=$QUEUE_POLL_INTERVAL_MS")
     }
 
+    /**
+     * Poller only auto-starts work when Auto Download is ON.
+     * Manual "Download" / Retry / enqueue with forceStart calls [startDownload] directly.
+     * This was the bug: poller previously started every QUEUED+URL item even when auto-download was off.
+     */
     private suspend fun pollQueuedWork() {
         if (!canExecuteDownloads()) return
+        if (!DownloadSettings.isAutoDownloadEnabled()) {
+            return
+        }
         val items = dao?.getAllItemsOnce().orEmpty()
         for (item in items) {
             if (item.status == "QUEUED" && item.hlsUrl.isNotBlank()) {
+                Log.i(TAG, "poller auto-start adamId=${item.adamId}")
                 startDownload(item.adamId)
             }
         }
@@ -297,19 +306,34 @@ object DownloadManager {
             }
 
             // Download fMP4 init segment (#EXT-X-MAP) for ALAC magic cookie / sample rate.
-            // Media fragments rarely contain moov; without cookie MediaMuxer often rejects the track.
+            // Path A (alac-download parity): cookie from init, media samples via trun sizes only.
             var initTrackInfo: TrackInfo? = null
+            var initTimescale = 0L
+            var initDefaultSampleDuration = 0L
+            var frameLength = 4096
             val mapUri = playlist.mapUri
             if (!mapUri.isNullOrBlank()) {
                 runCatching {
                     val initBytes = hlsDownloader.downloadSegment(mapUri)
                     Log.i(TAG, "init segment downloaded bytes=${initBytes.size} uri=$mapUri")
-                    initTrackInfo = alacExtractor.extractSamplesFromFmp4(initBytes).trackInfo
+                    // Prefer box walk (works without samples); MediaExtractor as secondary.
+                    val fromBoxes = Fmp4SampleSplitter.split(initBytes, 0f)
+                    initTrackInfo = fromBoxes.trackInfo
+                        ?: alacExtractor.extractSamplesFromFmp4(initBytes).trackInfo
                         ?: parseTrackInfoFromInitSegment(initBytes)
+                    initTimescale = initTrackInfo?.sampleRate?.toLong()?.takeIf { it > 0 } ?: 44100L
+                    frameLength = IsoBmffAlacWriter.frameLengthFromCookie(
+                        IsoBmffAlacWriter.normalizeAlacCookie(
+                            initTrackInfo?.csd0 ?: ByteArray(0),
+                            initTrackInfo?.sampleRate ?: 44100,
+                            initTrackInfo?.channelCount ?: 2,
+                        ),
+                    )
                     Log.i(
                         TAG,
                         "init trackInfo mime=${initTrackInfo?.mime} rate=${initTrackInfo?.sampleRate} " +
-                            "ch=${initTrackInfo?.channelCount} csd0=${initTrackInfo?.csd0?.size}",
+                            "ch=${initTrackInfo?.channelCount} csd0=${initTrackInfo?.csd0?.size} " +
+                            "frameLen=$frameLength ts=$initTimescale",
                     )
                 }.onFailure { e ->
                     Log.w(TAG, "init segment parse failed: ${e.message}")
@@ -318,13 +342,16 @@ object DownloadManager {
                 Log.w(TAG, "No #EXT-X-MAP in playlist; ALAC cookie will use defaults if needed")
             }
 
+            // Always sample-level decrypt (alac-download / Frida socket contract).
+            // Setting flag kept for logging only — we never whole-segment-decrypt containers.
             val preferSampleLevel = DownloadSettings.isPreferSampleLevelDecrypt()
+            Log.i(TAG, "decrypt mode=sample-level (forced, setting prefer=$preferSampleLevel)")
             var presentationCursorUs = 0L
             var sampleCount = 0
             var writerReady = false
             val title = item.title.ifBlank { "Track_$adamId" }
 
-            // Stream each segment → decrypt → write immediately.
+            // Stream each segment → split trun → decrypt each sample → write immediately.
             // NEVER accumulate all samples in heap (was OOM at 512MB).
             for ((index, segment) in segments.withIndex()) {
                 if (!isJobActive(adamId)) {
@@ -342,8 +369,10 @@ object DownloadManager {
                         val produced = decryptSegmentToSamples(
                             encryptedSegment = encryptedSegment,
                             segmentDurationSec = segment.duration,
-                            preferSampleLevel = preferSampleLevel,
                             presentationCursorUs = presentationCursorUs,
+                            defaultTimescale = initTimescale,
+                            defaultSampleDurationTicks = initDefaultSampleDuration,
+                            frameLengthSamples = frameLength,
                         )
 
                         if (!writerReady) {
@@ -354,10 +383,8 @@ object DownloadManager {
                                     "ch=${trackInfo.channelCount} csd0=${trackInfo.csd0?.size}",
                             )
                             if (!m4aWriter.init(title, trackInfo)) {
-                                val reason = m4aWriter.getInitError() ?: "ALAC M4A writers unavailable"
-                                throw Exception(
-                                    "Failed to create M4A (ALAC). WAV fallback disabled for compressed audio. $reason",
-                                )
+                                val reason = m4aWriter.getInitError() ?: "audio writer unavailable"
+                                throw Exception("Failed to create output file. $reason")
                             }
                             writerReady = true
                         }
@@ -371,7 +398,6 @@ object DownloadManager {
                             presentationCursorUs =
                                 last.presentationTimeUs + last.durationUs.coerceAtLeast(0L)
                         }
-                        // Drop references ASAP for GC.
                         segmentSuccess = true
                     } catch (e: Exception) {
                         segmentRetries++
@@ -568,147 +594,114 @@ object DownloadManager {
     )
 
     /**
-     * Prefer sample-level decrypt (matches original socket path):
-     * 1) Parse moof/trun sample sizes from encrypted fMP4
-     * 2) decrypt each sample (batched JNI when possible)
-     * 3) if sample-level fails or produces empty, fall back to whole-segment decrypt + extractor
+     * Path A — alac-download / Frida parity:
+     * 1) Parse moof/trun sample sizes from encrypted fMP4 (never decrypt the container)
+     * 2) decryptSample() once per sample payload (batched JNI)
+     * 3) emit bare ALAC packets only
+     *
+     * Whole-segment decrypt is intentionally NOT used: FairPlay encrypts sample payloads,
+     * and decrypting moof+mdat as one blob produces unplayable garbage.
      */
     private fun decryptSegmentToSamples(
         encryptedSegment: ByteArray,
         segmentDurationSec: Float,
-        preferSampleLevel: Boolean,
         presentationCursorUs: Long,
+        defaultTimescale: Long,
+        defaultSampleDurationTicks: Long,
+        frameLengthSamples: Int,
     ): SegmentDecryptResult {
-        if (preferSampleLevel) {
-            val split = Fmp4SampleSplitter.split(encryptedSegment, segmentDurationSec)
-            if (split.samples.size > 1 ||
-                (split.samples.size == 1 && split.samples[0].data.size < encryptedSegment.size)
-            ) {
-                val decryptedSamples = decryptSampleList(split.samples.map { it.data })
-                if (decryptedSamples != null && decryptedSamples.size == split.samples.size) {
-                    var pts = presentationCursorUs
-                    val audioSamples = ArrayList<AudioSample>(split.samples.size)
-                    for (i in split.samples.indices) {
-                        val plain = decryptedSamples[i]
-                        if (plain.isEmpty()) {
-                            throw Exception("Empty decrypt result for sample index=$i")
-                        }
-                        // FairPlay decrypt must yield bare ALAC packets, not fMP4 boxes.
-                        if (IsoBmffAlacWriter.looksLikeIsoBmff(plain)) {
-                            Log.w(TAG, "sample-level decrypt[$i] still looks like ISOBMFF size=${plain.size}")
-                            // Don't add container junk into muxer
-                            continue
-                        }
-                        val duration = split.samples[i].durationUs.let { d ->
-                            if (d > 0) d else {
-                                val total = (segmentDurationSec * 1_000_000f).toLong()
-                                if (split.samples.isNotEmpty()) total / split.samples.size else 0L
-                            }
-                        }
-                        audioSamples.add(
-                            AudioSample(
-                                data = ByteBuffer.wrap(plain),
-                                size = plain.size,
-                                presentationTimeUs = pts,
-                                durationUs = duration,
-                                isKeyFrame = split.samples[i].isKeyFrame,
-                            ),
-                        )
-                        pts += duration
-                    }
-                    if (audioSamples.isNotEmpty()) {
-                        Log.i(TAG, "sample-level decrypt ok count=${audioSamples.size}")
-                        return SegmentDecryptResult(audioSamples, split.trackInfo)
-                    }
-                }
-                Log.w(TAG, "sample-level decrypt failed/mismatch; falling back to segment decrypt")
-            }
+        val split = Fmp4SampleSplitter.split(
+            fmp4Data = encryptedSegment,
+            segmentDurationSec = segmentDurationSec,
+            defaultTimescale = defaultTimescale,
+            defaultSampleDurationTicks = defaultSampleDurationTicks,
+            frameLengthSamples = frameLengthSamples,
+        )
+        Log.i(
+            TAG,
+            "split diag fromTrun=${split.fromTrun} count=${split.samples.size} " +
+                "mdat=${split.mdatSize} ${split.diagnostics}",
+        )
+        if (split.samples.isEmpty()) {
+            throw Exception("fMP4 split produced 0 samples (${split.diagnostics})")
         }
 
-        // Fallback: decrypt whole segment then extract frames (legacy path).
-        // FairPlay often encrypts only mdat sample payloads; whole-segment decrypt may
-        // return a full fMP4 with plaintext mdat — never write that container as one ALAC sample.
-        val decrypted = AppleMusicNativeBridge.decryptSample(encryptedSegment)
-            ?: throw Exception("Segment decrypt returned null")
-        if (decrypted.isEmpty()) {
-            throw Exception("Segment decrypt returned empty")
-        }
-
-        val extracted = alacExtractor.extractSamplesFromFmp4(decrypted)
-        if (extracted.success && extracted.samples.isNotEmpty()) {
-            var pts = presentationCursorUs
-            val remapped = extracted.samples.mapNotNull { sample ->
-                // Drop accidental ISOBMFF boxes
-                val head = ByteArray(minOf(8, sample.size))
-                sample.data.duplicate().apply { position(0) }.get(head)
-                if (IsoBmffAlacWriter.looksLikeIsoBmff(head) && sample.size > 16) {
-                    Log.w(TAG, "drop extracted sample that still looks like ISOBMFF size=${sample.size}")
-                    return@mapNotNull null
-                }
-                val duration = if (sample.durationUs > 0) {
-                    sample.durationUs
-                } else {
-                    (segmentDurationSec * 1_000_000f).toLong() / extracted.samples.size.coerceAtLeast(1)
-                }
-                val out = AudioSample(
-                    data = sample.data.duplicate(),
-                    size = sample.size,
-                    presentationTimeUs = if (sample.presentationTimeUs > 0) sample.presentationTimeUs else pts,
-                    durationUs = duration,
-                    isKeyFrame = sample.isKeyFrame,
-                )
-                pts = out.presentationTimeUs + duration
-                out
-            }
-            if (remapped.isNotEmpty()) {
-                return SegmentDecryptResult(remapped, extracted.trackInfo)
-            }
-        }
-
-        // Last resort: only if decrypted payload is NOT an fMP4 container (bare ALAC frame).
-        if (IsoBmffAlacWriter.looksLikeIsoBmff(decrypted)) {
-            // Try splitting plaintext fMP4 via trun sizes (mdat is already decrypted in place).
-            val splitPlain = Fmp4SampleSplitter.split(decrypted, segmentDurationSec)
-            if (splitPlain.samples.isNotEmpty() &&
-                !IsoBmffAlacWriter.looksLikeIsoBmff(splitPlain.samples[0].data)
-            ) {
-                var pts = presentationCursorUs
-                val audioSamples = splitPlain.samples.map { s ->
-                    val duration = if (s.durationUs > 0) s.durationUs else {
-                        val total = (segmentDurationSec * 1_000_000f).toLong()
-                        if (splitPlain.samples.isNotEmpty()) total / splitPlain.samples.size else 0L
-                    }
-                    val out = AudioSample(
-                        data = ByteBuffer.wrap(s.data),
-                        size = s.data.size,
-                        presentationTimeUs = pts,
-                        durationUs = duration,
-                        isKeyFrame = s.isKeyFrame,
-                    )
-                    pts += duration
-                    out
-                }
-                Log.i(TAG, "plaintext fMP4 split ok count=${audioSamples.size}")
-                return SegmentDecryptResult(audioSamples, splitPlain.trackInfo ?: extracted.trackInfo)
-            }
+        // Even single-sample (whole mdat) is OK if it is pure sample payload without boxes.
+        val encryptedPayloads = split.samples.map { it.data }
+        // Reject if the "sample" still looks like a top-level box (wrong split).
+        val first = encryptedPayloads[0]
+        if (IsoBmffAlacWriter.looksLikeIsoBmff(first) && first.size > 16) {
             throw Exception(
-                "Decrypted segment is still fMP4 container and frame extraction failed " +
-                    "(size=${decrypted.size}). Cannot mux as ALAC sample.",
+                "split sample still looks like ISOBMFF (fromTrun=${split.fromTrun} " +
+                    "size=${first.size}). ${split.diagnostics}",
             )
         }
 
-        val durationUs = (segmentDurationSec * 1_000_000f).toLong()
-        return SegmentDecryptResult(
-            samples = listOf(
+        val decryptedSamples = decryptSampleList(encryptedPayloads)
+            ?: throw Exception("sample-level decrypt failed (null/empty batch)")
+        if (decryptedSamples.size != encryptedPayloads.size) {
+            throw Exception(
+                "decrypt count mismatch in=${encryptedPayloads.size} out=${decryptedSamples.size}",
+            )
+        }
+
+        var pts = presentationCursorUs
+        val audioSamples = ArrayList<AudioSample>(decryptedSamples.size)
+        var skippedIso = 0
+        for (i in decryptedSamples.indices) {
+            val plain = decryptedSamples[i]
+            if (plain.isEmpty()) {
+                throw Exception("Empty decrypt result for sample index=$i")
+            }
+            if (IsoBmffAlacWriter.looksLikeIsoBmff(plain)) {
+                skippedIso++
+                if (skippedIso <= 2) {
+                    Log.w(
+                        TAG,
+                        "decrypt[$i] still ISOBMFF size=${plain.size} " +
+                            "head=${plain.take(8).joinToString("") { "%02x".format(it) }}",
+                    )
+                }
+                continue
+            }
+            val duration = split.samples[i].durationUs.let { d ->
+                if (d > 0) d else {
+                    val total = (segmentDurationSec * 1_000_000f).toLong()
+                    if (split.samples.isNotEmpty()) total / split.samples.size else 0L
+                }
+            }
+            audioSamples.add(
                 AudioSample(
-                    data = ByteBuffer.wrap(decrypted),
-                    size = decrypted.size,
-                    presentationTimeUs = presentationCursorUs,
-                    durationUs = durationUs,
+                    data = ByteBuffer.wrap(plain),
+                    size = plain.size,
+                    presentationTimeUs = pts,
+                    durationUs = duration,
+                    isKeyFrame = split.samples[i].isKeyFrame,
                 ),
-            ),
-            trackInfo = extracted.trackInfo,
+            )
+            pts += duration
+        }
+        if (audioSamples.isEmpty()) {
+            throw Exception(
+                "all samples skipped after decrypt (isoBmff=$skippedIso total=${decryptedSamples.size})",
+            )
+        }
+        if (audioSamples.size == 1 && audioSamples[0].size > 256 * 1024) {
+            Log.w(
+                TAG,
+                "only 1 large sample size=${audioSamples[0].size} — trun may be missing; " +
+                    "playback may fail. ${split.diagnostics}",
+            )
+        }
+        Log.i(
+            TAG,
+            "sample-level decrypt ok count=${audioSamples.size} skippedIso=$skippedIso " +
+                "fromTrun=${split.fromTrun} firstSize=${audioSamples[0].size} " +
+                "firstHead=${ByteArray(minOf(8, audioSamples[0].size)).also { h ->
+                    audioSamples[0].data.duplicate().apply { position(0) }.get(h)
+                }.joinToString("") { "%02x".format(it) }}",
         )
+        return SegmentDecryptResult(audioSamples, split.trackInfo)
     }
 
     private fun decryptSampleList(encryptedSamples: List<ByteArray>): List<ByteArray>? {
@@ -769,18 +762,20 @@ object DownloadManager {
      * Auto-download is gated by DownloadSettings.isAutoDownloadEnabled().
      * Manual enqueue always works regardless of the toggle.
      */
-    fun provideHlsUrl(adamId: String, hlsUrl: String, autoEnqueue: Boolean = true) {
+    /**
+     * Record HLS URL from hook. Starts download ONLY when [autoEnqueue] is true
+     * (i.e. Auto Download setting ON). Never starts just because URL arrived.
+     */
+    fun provideHlsUrl(adamId: String, hlsUrl: String, autoEnqueue: Boolean = false) {
         if (!initialized || adamId.isBlank() || hlsUrl.isBlank()) {
             return
         }
         scope.launch {
             val existing = dao?.getItem(adamId)
             if (existing != null) {
-                val waitingForUrl = existing.hlsUrl.isBlank()
                 if (existing.hlsUrl != hlsUrl) {
                     dao?.update(existing.copy(hlsUrl = hlsUrl))
                 }
-                // Update shared queue
                 runCatching {
                     SharedQueueStore.upsertSync(
                         SharedQueueStore.QueueEntry(
@@ -791,15 +786,23 @@ object DownloadManager {
                         )
                     )
                 }
-                val shouldStart = (existing.status == "QUEUED" || existing.status == "FAILED") &&
-                    (autoEnqueue || waitingForUrl)
-                if (shouldStart && canExecuteDownloads()) {
+                // Only auto-start when explicitly allowed AND status is idle queued.
+                // Do NOT start merely because URL was missing before.
+                val shouldStart = autoEnqueue &&
+                    existing.status == "QUEUED" &&
+                    canExecuteDownloads()
+                if (shouldStart) {
                     startDownload(adamId)
+                    Log.i(TAG, "Auto-download started (existing) adamId=$adamId")
+                } else {
+                    Log.i(
+                        TAG,
+                        "URL recorded no-start adamId=$adamId status=${existing.status} auto=$autoEnqueue",
+                    )
                 }
                 return@launch
             }
 
-            // New track from hook
             dao?.insert(
                 DownloadQueueItem(
                     adamId = adamId,
@@ -808,13 +811,13 @@ object DownloadManager {
                     hlsUrl = hlsUrl,
                 ),
             )
-            // Shared queue
             runCatching {
                 SharedQueueStore.upsertSync(
                     SharedQueueStore.QueueEntry(
                         adamId = adamId,
                         title = "Track $adamId",
                         hlsUrl = hlsUrl,
+                        status = "QUEUED",
                     )
                 )
             }
@@ -822,7 +825,34 @@ object DownloadManager {
                 startDownload(adamId)
                 Log.i(TAG, "Auto-download started adamId=$adamId")
             } else {
-                Log.i(TAG, "Recorded track without auto-start adamId=$adamId auto=$autoEnqueue executor=$executorMode")
+                Log.i(TAG, "Recorded track without auto-start adamId=$adamId auto=$autoEnqueue")
+            }
+        }
+    }
+
+    /** Explicit user-triggered start (Manual Add / Retry / Download button). */
+    fun forceStart(adamId: String) {
+        if (!initialized || adamId.isBlank()) return
+        scope.launch {
+            val item = dao?.getItem(adamId)
+            if (item == null) {
+                Log.w(TAG, "forceStart: no local item adamId=$adamId")
+                return@launch
+            }
+            if (item.hlsUrl.isBlank()) {
+                Log.w(TAG, "forceStart: no HLS URL yet adamId=$adamId — play track once in Apple Music")
+                return@launch
+            }
+            if (item.status == "COMPLETED") {
+                Log.i(TAG, "forceStart: already completed adamId=$adamId path=${item.filePath}")
+                return@launch
+            }
+            dao?.update(item.copy(status = "QUEUED", progress = 0, errorMessage = ""))
+            if (canExecuteDownloads()) {
+                startDownload(adamId)
+                Log.i(TAG, "forceStart download adamId=$adamId")
+            } else {
+                Log.w(TAG, "forceStart: executor not ready adamId=$adamId")
             }
         }
     }

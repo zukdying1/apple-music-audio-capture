@@ -61,7 +61,7 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        DownloadSettings.ensureLoaded()
+        DownloadSettings.init(applicationContext)
         // ContentProvider-backed queue — same backend as the Apple Music hook process.
         SharedQueueStore.init(applicationContext)
         // UI process only observes/enqueues. Downloads run in Apple Music process.
@@ -264,10 +264,17 @@ fun DownloadItemCard(
                 }
                 if (item.status == "COMPLETED" && item.filePath.isNotBlank()) {
                     Text(
-                        text = item.filePath.substringAfterLast('/'),
+                        text = item.filePath,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
                     )
+                }
+                if (item.status == "QUEUED" && item.hlsUrl.isNotBlank()) {
+                    OutlinedButton(
+                        onClick = { viewModel.retry(item.adamId) },
+                    ) {
+                        Text("Download now")
+                    }
                 }
             }
         }
@@ -403,12 +410,25 @@ fun SettingsTab() {
 
         SettingsSwitchRow(
             title = "Auto Download",
-            subtitle = "When enabled, requestAsset intercepts auto-start download for new adamId.",
+            subtitle = "OFF = only queue on play; tap Retry/Download now to start. ON = auto start after URL capture.",
             checked = autoDownload,
             onCheckedChange = {
                 autoDownload = it
                 DownloadSettings.setAutoDownloadEnabled(it)
             },
+        )
+        Text(
+            text = "Settings file: ${DownloadSettings.getActivePath()}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Output files are under Apple Music app storage, e.g.\n" +
+                "/storage/emulated/0/Android/data/com.apple.android.music/files/Music/AppleDecryptor/\n" +
+                "(not the system Music library — use MT Manager / Files to open that path)",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         SettingsSwitchRow(
@@ -596,6 +616,9 @@ class DownloadViewModel : androidx.lifecycle.ViewModel() {
                 )
             )
             DownloadManager.retry(adamId)
+            // Explicit user action — force start even if Auto Download is OFF
+            // (only works when Apple Music executor process is alive)
+            DownloadManager.forceStart(adamId)
             refresh()
         }
     }

@@ -60,7 +60,13 @@ class AppleDecryptorModule : XposedModule() {
         targetClassLoader.set(param.classLoader)
         packageReadyParamRef.set(param)
 
-        DownloadSettings.ensureLoaded()
+        // Context-aware settings (multi-path; /sdcard alone often EPERM)
+        val earlyCtx = resolveApplicationContext(param)
+        if (earlyCtx != null) {
+            DownloadSettings.init(earlyCtx)
+        } else {
+            DownloadSettings.ensureLoaded()
+        }
 
         // Resolve application context from PackageReadyParam (libxposed) or ActivityThread fallback.
         // NOTE: onPackageReady often runs BEFORE Application is ready → context may be null.
@@ -124,15 +130,19 @@ class AppleDecryptorModule : XposedModule() {
                 requestAssetMethod.compareAndSet(null, requestAsset)
 
                 val args = chain.args.toTypedArray()
-                // Apple Music 5.2.1 smali: p3 (String) is immediately overwritten by released flag read.
-                // Real song id is always the long p1/p2 (args[0]). Force HLS flavor list on args[2].
+                // Apple Music 5.2.1: real song id is long args[0].
+                // DO NOT replace assetKinds with ["HLS"] — that causes
+                // subscription_drm_error_title "此内容未得到授权" and pauses playback
+                // because LeaseAssetRequest expects preferredFlavors from AssetFlavorSelector.
                 val adamIdFromArgs = extractAdamId(args)
-                moduleLog(Log.WARN, TAG, "requestAsset before: ${AppleMusicHookCore.describeRequestAssetArgs(args)}")
-                if (args.size >= 3) {
-                    args[2] = AppleMusicHookCore.hlsAssetKinds()
-                }
-                moduleLog(Log.WARN, TAG, "requestAsset after: ${AppleMusicHookCore.describeRequestAssetArgs(args)}")
+                val originalKinds = (args.getOrNull(2) as? Array<*>)?.joinToString(",")
+                moduleLog(
+                    Log.WARN,
+                    TAG,
+                    "requestAsset before: ${AppleMusicHookCore.describeRequestAssetArgs(args)} kindsRaw=$originalKinds",
+                )
 
+                // Proceed with ORIGINAL flavors so Apple Music keeps playing.
                 val result = chain.proceed(args)
                 val meta = AppleMusicHookCore.extractMediaAssetMeta(result)
                 moduleLog(
@@ -141,20 +151,32 @@ class AppleDecryptorModule : XposedModule() {
                     "requestAsset result: ${meta?.describe() ?: AppleMusicHookCore.describeRequestAssetResult(result)}",
                 )
 
-                // Prefer adamId from MediaAssetInfo.getAdamId(); fall back to long arg.
                 val adamId = meta?.adamId?.takeIf { it != 0L }?.toString()
                     ?: adamIdFromArgs
-                val hlsUrl = meta?.downloadUrl
+                // Prefer URL when flavor is already HLS; progressive still has downloadUrl.
+                val mediaUrl = meta?.downloadUrl
                     ?: AppleMusicHookCore.extractDownloadUrl(result)
                     ?: lastSeenHlsUrl?.takeIf { lastSeenAdamId == adamId }
 
                 handleAssetCaptured(
                     adamId = adamId,
-                    hlsUrl = hlsUrl,
+                    hlsUrl = mediaUrl,
                     flavor = meta?.flavor,
                     keyServerUrl = meta?.keyServerUrl,
                     source = "requestAsset",
                 )
+
+                // Optional: if auto-download ON and this was not HLS, request HLS in background
+                // without affecting the result returned to the player.
+                val flavor = meta?.flavor.orEmpty()
+                if (DownloadSettings.isAutoDownloadEnabled() &&
+                    adamId != null &&
+                    !flavor.equals("HLS", ignoreCase = true)
+                ) {
+                    runCatching {
+                        requestHlsUrlAsync(adamId)
+                    }
+                }
 
                 result
             }
@@ -667,6 +689,31 @@ class AppleDecryptorModule : XposedModule() {
         return buffer
     }
 
+    /**
+     * Background-only HLS lease request. Must NEVER replace the in-flight player asset.
+     * Used when auto-download needs HLS but playback used progressive/other flavor.
+     */
+    private fun requestHlsUrlAsync(adamId: String) {
+        Thread({
+            val url = requestHlsUrl(adamId)
+            if (!url.isNullOrBlank()) {
+                moduleLog(Log.WARN, TAG, "async HLS capture adamId=$adamId url=${AppleMusicHookCore.summarizeUri(url)}")
+                handleAssetCaptured(
+                    adamId = adamId,
+                    hlsUrl = url,
+                    flavor = "HLS",
+                    keyServerUrl = null,
+                    source = "asyncHls",
+                )
+            } else {
+                moduleLog(Log.WARN, TAG, "async HLS capture failed adamId=$adamId")
+            }
+        }, "AppleDecryptor-AsyncHls").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
     private fun requestHlsUrl(adamId: String): String? {
         var proxy = playbackLeaseProxy.get()
         var method = requestAssetMethod.get()
@@ -681,11 +728,17 @@ class AppleDecryptorModule : XposedModule() {
         }
 
         return runCatching {
-            val result = method.invoke(proxy, adamId.toLongOrNull() ?: 0L, null, AppleMusicHookCore.hlsAssetKinds(), false)
+            // HLS-only flavors ONLY for this side-channel request, not for player path.
+            val result = method.invoke(
+                proxy,
+                adamId.toLongOrNull() ?: 0L,
+                null,
+                AppleMusicHookCore.hlsAssetKinds(),
+                false,
+            )
             AppleMusicHookCore.extractDownloadUrl(result)
         }.onFailure { error ->
             moduleLog(Log.WARN, TAG, "M3U8 requestAsset refresh failed for adamId=$adamId", error)
-            // If invocation fails, proxy may be stale — clear for rediscovery
             if (error is IllegalArgumentException || error is NullPointerException) {
                 playbackLeaseProxy.compareAndSet(proxy, null)
             }
