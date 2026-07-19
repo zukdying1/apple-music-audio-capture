@@ -1,5 +1,6 @@
 package com.neurax08.xposed.appledecryptor.download
 
+import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.MediaMuxer
@@ -14,16 +15,19 @@ import java.nio.ByteOrder
  * Writes decrypted audio samples.
  *
  * Preferred path: ALAC frames into MPEG-4 via MediaMuxer.
- * Fallback path: manual ISOBMFF ALAC writer ([IsoBmffAlacWriter]) when MediaMuxer
- * rejects audio/alac (common on OEM ROMs even with API 30+).
+ * Fallback path: manual ISOBMFF ALAC writer when MediaMuxer rejects audio/alac.
  * WAV fallback is ONLY used for raw PCM.
+ *
+ * Output directory is resolved via [OutputPaths] (never hard-require /sdcard).
  */
-class M4aWriter {
+class M4aWriter(private val context: Context? = null) {
     companion object {
         private const val TAG = "AppleDecryptor"
         private const val ALAC_MIME = "audio/alac"
         private const val PCM_MIME = "audio/raw"
-        const val OUTPUT_DIR = "/sdcard/Music/AppleDecryptor"
+
+        /** @deprecated use OutputPaths.musicDir(context) */
+        const val OUTPUT_DIR = OutputPaths.LEGACY_PUBLIC
     }
 
     enum class OutputMode {
@@ -46,36 +50,38 @@ class M4aWriter {
     private var initError: String? = null
     private var manualWriter: IsoBmffAlacWriter? = null
     private var effectiveTrackInfo: TrackInfo? = null
+    private var activeOutputDir: File? = null
 
     fun init(title: String, trackInfo: TrackInfo): Boolean {
         reset()
 
-        val dir = File(OUTPUT_DIR)
-        if (!dir.exists()) {
-            dir.mkdirs()
+        val dir = OutputPaths.musicDir(context)
+        activeOutputDir = dir
+        if (!dir.exists() && !dir.mkdirs()) {
+            initError = "Cannot create output dir: ${dir.absolutePath}"
+            Log.e(TAG, initError!!)
+            return false
         }
 
-        val safeTitle = title.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-            .takeIf { it.isNotBlank() } ?: "unknown"
-        val m4aPath = "$OUTPUT_DIR/$safeTitle.m4a"
-        val wavPath = "$OUTPUT_DIR/$safeTitle.wav"
+        val safeName = OutputPaths.safeFileName(title, "m4a")
+        val m4aPath = File(dir, safeName).absolutePath
+        val wavPath = File(dir, OutputPaths.safeFileName(title, "wav")).absolutePath
         nextPresentationTimeUs = 0L
 
         val mime = trackInfo.mime.ifBlank { ALAC_MIME }
         val isPcm = mime.equals(PCM_MIME, ignoreCase = true) ||
             mime.equals("audio/pcm", ignoreCase = true)
 
-        // Ensure ALAC has a usable magic cookie for muxers / players.
         val normalized = normalizeTrackInfo(trackInfo)
         effectiveTrackInfo = normalized
 
+        Log.i(TAG, "M4aWriter init dir=${dir.absolutePath} title=$title")
+
         if (!isPcm) {
-            // 1) Try MediaMuxer
             val muxerOk = tryInitMediaMuxer(m4aPath, normalized)
             if (muxerOk) return true
 
-            // 2) Manual ISOBMFF fallback (always works if we can write the file)
-            val manual = IsoBmffAlacWriter()
+            val manual = IsoBmffAlacWriter(context)
             if (manual.init(m4aPath, normalized)) {
                 manualWriter = manual
                 isStarted = true
@@ -96,7 +102,6 @@ class M4aWriter {
             return false
         }
 
-        // PCM-only WAV path
         return try {
             wavOutputStream = FileOutputStream(wavPath)
             wavSampleRate = normalized.sampleRate.coerceAtLeast(1)
@@ -149,12 +154,12 @@ class M4aWriter {
     fun getOutputMode(): OutputMode = outputMode
     fun getInitError(): String? = initError
     fun isFallbackWav(): Boolean = outputMode == OutputMode.PCM_WAV
+    fun getActiveOutputDir(): String = activeOutputDir?.absolutePath.orEmpty()
 
     private fun normalizeTrackInfo(trackInfo: TrackInfo): TrackInfo {
         val rate = trackInfo.sampleRate.takeIf { it > 0 } ?: 44100
         val ch = trackInfo.channelCount.takeIf { it > 0 } ?: 2
         val raw = trackInfo.csd0
-        // Pure 24-byte ALACSpecificConfig for MediaCodec csd-0 (ExoPlayer AtomParsers)
         val cookie = if (raw != null && raw.isNotEmpty()) {
             IsoBmffAlacWriter.normalizeAlacCookie(raw, rate, ch)
         } else {
@@ -209,7 +214,6 @@ class M4aWriter {
             isStarted = false
             outputMode = OutputMode.NONE
             initError = "MediaMuxer ALAC failed: ${e.message}"
-            // delete partial file
             runCatching { File(m4aPath).delete() }
             false
         }
@@ -248,7 +252,6 @@ class M4aWriter {
             format.setByteBuffer("csd-0", ByteBuffer.wrap(csd))
         }
 
-        // Some devices want max input size
         format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, (sampleRate * channelCount).coerceAtLeast(4096) * 4)
         return format
     }

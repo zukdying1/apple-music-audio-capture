@@ -249,7 +249,10 @@ object DownloadManager {
         updateProgress(adamId, "", 0, "DOWNLOADING")
 
         val item = dao?.getItem(adamId) ?: return
-        val m4aWriter = M4aWriter()
+        // Pass host Context so OutputPaths can use getExternalFilesDir / filesDir / cacheDir
+        // ( /sdcard/Music is EPERM under Apple Music process on Android 11+ ).
+        val m4aWriter = M4aWriter(ctx)
+        Log.i(TAG, "download output dir candidates via OutputPaths; primary probe=${OutputPaths.musicDir(ctx).absolutePath}")
         dao?.update(item.copy(status = "DOWNLOADING"))
         runCatching {
             SharedQueueStore.upsertSync(

@@ -17,7 +17,9 @@ import java.nio.charset.StandardCharsets
  * write final file as ftyp + moov + mdat payload. Avoids 64-bit "largesize" mdat
  * (common cause of setDataSource status=0x80000000 on Android).
  */
-class IsoBmffAlacWriter {
+class IsoBmffAlacWriter(
+    private val context: android.content.Context? = null,
+) {
     companion object {
         private const val TAG = "AppleDecryptor"
 
@@ -175,21 +177,42 @@ class IsoBmffAlacWriter {
         if (cookieBd in 16..32) bitDepth = cookieBd
 
         return try {
-            val outFile = File(path)
-            outFile.parentFile?.mkdirs()
+            // Resolve a writable final path: prefer the requested path, else OutputPaths.musicDir.
+            var outFile = File(path)
+            var parent = outFile.parentFile
+            fun parentWritable(p: File?): Boolean {
+                if (p == null) return false
+                return try {
+                    if (!p.exists() && !p.mkdirs()) return false
+                    val probe = File(p, ".wprobe_${System.nanoTime()}")
+                    probe.writeText("ok")
+                    probe.delete()
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+            }
+            if (!parentWritable(parent)) {
+                val fallbackDir = OutputPaths.musicDir(context)
+                outFile = File(fallbackDir, outFile.name)
+                parent = fallbackDir
+                Log.w(TAG, "final path parent not writable; fallback=${outFile.absolutePath}")
+            }
             if (outFile.exists()) outFile.delete()
 
-            val tmp = File(outFile.parentFile, outFile.name + ".mdat.tmp")
+            // ALWAYS put .mdat.tmp in cache/temp — never on /sdcard (EPERM).
+            val tmpDir = OutputPaths.tempDir(context)
+            val tmp = File(tmpDir, outFile.name + ".mdat.tmp")
             if (tmp.exists()) tmp.delete()
             mdatTmpFile = tmp
             mdatTmp = RandomAccessFile(tmp, "rw")
-            outputPath = path
+            outputPath = outFile.absolutePath
             started = true
             Log.i(
                 TAG,
-                "IsoBmffAlacWriter init path=$path rate=$sampleRate ch=$channelCount " +
-                    "bitDepth=$bitDepth frameLen=$frameLength csd0=${csd0.size} " +
-                    "csd0hex=${csd0.take(16).joinToString("") { "%02x".format(it) }}",
+                "IsoBmffAlacWriter init path=$outputPath tmp=${tmp.absolutePath} " +
+                    "rate=$sampleRate ch=$channelCount bitDepth=$bitDepth frameLen=$frameLength " +
+                    "csd0=${csd0.size} csd0hex=${csd0.take(16).joinToString("") { "%02x".format(it) }}",
             )
             true
         } catch (e: Exception) {
